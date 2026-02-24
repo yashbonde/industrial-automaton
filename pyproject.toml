@@ -1,0 +1,40 @@
+[project]
+name = "industrial-automaton"
+version = "0.1.0"
+description = "Industrial-strength neural automata tasks and generators"
+readme = "README.md"
+authors = [{ name = "Yash Bonde" }]
+license = { text = "MIT" }
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.4.2",
+    "scipy>=1.17.0",
+    "jax>=0.4.33",
+    "jaxlib>=0.4.33",
+    "equinox>=0.11.10",
+    "optax>=0.2.4",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "tensorboardX>=2.6",
+    "randomname>=0.2.1",
+]
+
+[project.scripts]
+inmaton = "industrial_automaton.cli:cli"
+inmaton-tasks = "industrial_automaton.cli:print_task_configs"
+inmaton-models = "industrial_automaton.cli:print_model_configs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/industrial_automaton"]
+
+[dependency-groups]
+dev = [
+    "pillow>=12.1.1",
+    "pymupdf>=1.27.1",
+    "requests>=2.32.5",
+    "pytest>=8.3.4",
+]
