@@ -117,6 +117,10 @@ results is a win. Weigh complexity cost against improvement magnitude.
 **The first run**: Your very first run should always establish the baseline — run with
 the best known config from `EXPERIMENTS.md` without any changes.
 
+**OOD Generalisation**: All models when evaled on their training size work well, we want
+models that can generalise to much longer sequence lengths, that is the real test. Keep
+eval max seqlen atleast 20x longer than training.
+
 ## Seed policy
 
 Results only count if they hold across **two seeds**.
