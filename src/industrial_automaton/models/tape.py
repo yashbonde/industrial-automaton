@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import equinox as eqx
 
 from industrial_automaton.vocab import SIZE as VOCAB_SIZE
@@ -84,7 +85,7 @@ class VanillaRNNCell(eqx.Module):
 # === TAPE-RNN ===
 
 class TapeRNNState(NamedTuple):
-    memory: jnp.ndarray   # (MemorySize, memory_cell_size)
+    memory: jnp.ndarray   # (num_heads, MemorySize, memory_cell_size)
     hidden: Any           # (hidden_size,) array or tuple of arrays for LSTM
 
 class TapeRNNConfig(BaseModel):
@@ -100,7 +101,7 @@ class TapeRNN(BaseAutomata):
     """Tape-RNN matching Delétang et al. (2023) with enhancements:
     - Flexible controller (VanillaRNN, GRU, or LSTM)
     - Windowed read head (3 cells) per head
-    - MLP write head per head
+    - MLP write head (shared or independent per head via single large linear)
     - Learnable tape initialization
     - Initial action bias favoring Right movement
     - Multi-head support: multiple independent tape positions
@@ -111,7 +112,9 @@ class TapeRNN(BaseAutomata):
     W_m: jnp.ndarray               # (hidden_size, num_heads * memory_cell_size * 3)
     W_a: jnp.ndarray               # (num_heads * 5, hidden_size) — action logits
     b_a: jnp.ndarray               # (num_heads * 5,) — action bias
-    write_heads: List[eqx.Module]  # List of MLP heads (hidden_size -> memory_cell_size)
+    write_l1: eqx.nn.Linear        # hidden_size -> 64
+    write_l2: eqx.nn.Linear        # 64 -> 64
+    write_l3: eqx.nn.Linear        # 64 -> num_heads * memory_cell_size
     tape_init: jnp.ndarray         # (memory_size, memory_cell_size)
 
     vocab_size: int = eqx.field(static=True)
@@ -154,20 +157,11 @@ class TapeRNN(BaseAutomata):
             bias[h * 5 + 2] = 3.0
         self.b_a = jnp.array(bias)
         
-        # MLP write heads
-        self.write_heads = []
-        kw = jax.random.split(k4, config.num_heads)
-        for i in range(config.num_heads):
-            # MLP: hidden_size -> 64 -> 64 -> memory_cell_size
-            k_head = jax.random.split(kw[i], 3)
-            head = eqx.nn.Sequential([
-                eqx.nn.Linear(config.hidden_size, 64, key=k_head[0]),
-                eqx.nn.Lambda(jax.nn.relu),
-                eqx.nn.Linear(64, 64, key=k_head[1]),
-                eqx.nn.Lambda(jax.nn.relu),
-                eqx.nn.Linear(64, config.memory_cell_size, key=k_head[2]),
-            ])
-            self.write_heads.append(head)
+        # MLP write head: hidden_size -> 64 -> 64 -> num_heads * memory_cell_size
+        k4a, k4b, k4c = jax.random.split(k4, 3)
+        self.write_l1 = eqx.nn.Linear(config.hidden_size, 64, key=k4a)
+        self.write_l2 = eqx.nn.Linear(64, 64, key=k4b)
+        self.write_l3 = eqx.nn.Linear(64, config.num_heads * config.memory_cell_size, key=k4c)
         
         # Learnable tape initialization
         self.tape_init = jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
@@ -183,11 +177,6 @@ class TapeRNN(BaseAutomata):
         else:
             hidden = jnp.zeros(self.hidden_size, dtype=dtype)
         
-        # Each head has its own tape view (but they share the same physical tape)
-        # Wait, if they share the tape, they should have different POSITIONS.
-        # But our TapeRNN shifts the tape instead of moving the head.
-        # So multi-head TapeRNN needs multiple TAPES or a different representation.
-        # Let's use multiple TAPES for now (easiest to implement with current logic).
         return TapeRNNState(
             memory=jnp.tile(self.tape_init[None, ...], (self.num_heads, 1, 1)),
             hidden=hidden,
@@ -205,7 +194,9 @@ class TapeRNN(BaseAutomata):
         for h in range(self.num_heads):
             # Each head sees its own shifted view of the tape
             m_h = memory[h]
-            windows.append(jnp.concatenate([m_h[-1], m_h[0], m_h[1]]))
+            # Window of size 3: left, center, right
+            w = jnp.concatenate([m_h[-1], m_h[0], m_h[1]])
+            windows.append(w)
         
         mem_read = self.W_m @ jnp.concatenate(windows)   # (hidden_size,)
 
@@ -220,10 +211,14 @@ class TapeRNN(BaseAutomata):
         a_t = jax.nn.softmax(action_logits.reshape(self.num_heads, 5), axis=-1)
 
         # 4. Write value via MLP for each head
-        # Each head writes its own content to its view of the tape
+        n_t_all = jax.nn.relu(self.write_l1(h_new_t))
+        n_t_all = jax.nn.relu(self.write_l2(n_t_all))
+        n_t_all = self.write_l3(n_t_all) # (num_heads * memory_cell_size,)
+        n_t_all = n_t_all.reshape(self.num_heads, self.memory_cell_size)
+
         memory_new_list = []
         for h in range(self.num_heads):
-            n_t = self.write_heads[h](h_new_t) # (memory_cell_size,)
+            n_t = n_t_all[h]
             
             # Write to tape cell 0, then apply weighted shift
             m_h = memory[h]
@@ -260,7 +255,6 @@ class TapeRNN(BaseAutomata):
     def __call__(self, inputs: jnp.ndarray, state: TapeRNNState, pad_mask, input_length=None):
         """Process sequence. inputs: (T, embedding_dim). Returns (hidden_states (T, hidden_size), final_state)."""
         # Use actual input length for jumps; fall back to full seq len.
-        # Keep as JAX array — jnp.roll supports traced shift values.
         jump_len = input_length if input_length is not None else jnp.array(inputs.shape[0])
 
         def scan_fn(carry, x_and_valid):
