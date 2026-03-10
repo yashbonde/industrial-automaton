@@ -1,219 +1,380 @@
-"""Unified vocabulary for all tasks.
+"""Neural Symbolic Language (NSL) Vocabulary.
 
-Token layout:
-  [0..99]       D0 .. D99           (digit tokens, ID = value)
-  [100]         PAD
-  [101]         BOS
-  [102]         EOS
-  [103]         SEP
-  [104..139]    TASK_0 .. TASK_35   (36 task ID tokens)
-  [140..143]    OP_ADD, OP_SUB, OP_MUL, OP_EQ
-  [144..183]    OPEN_0..OPEN_19, CLOSE_0..CLOSE_19  (Dyck brackets)
-  [184]         VAR_X
-  [185]         OPEN_PAREN          (arithmetic parenthesis)
-  [186]         CLOSE_PAREN
-  [187]         STACK_POP
-  [188]         NAV_FWD
-  [189]         NAV_BWD
-  [190]         HASH_SEP            (n-back separator)
-  [191]         TRUE
-  [192]         FALSE
-  [193]         PROG_ASSIGN
-  [194]         PROG_LOOP_START
-  [195]         PROG_LOOP_END
-  [196..199]    REL_ABOVE, REL_BELOW, REL_LEFT, REL_RIGHT
+55-token unified vocabulary across 3 semantic types.
+
+Token Layout
+============
+  DIGIT      [0..34]   — values the model processes
+  OPERATIONAL[35..48]  — structural/operator tokens
+  SYSTEM     [49..54]  — sequence metadata tokens
+
+DIGIT (35 tokens):
+  [0..31]   D0 .. D31       base-32 digits (token ID = value)
+  [32]      ZERO             structural null value (think-phase input)
+  [33]      TRUE
+  [34]      FALSE
+
+OPERATIONAL (14 tokens):
+  [35]  OP_ADD
+  [36]  OP_SUB
+  [37]  OP_MUL
+  [38]  OP_EQ
+  [39]  OPEN              Dyck/grouping open  — always followed by digit arg
+  [40]  CLOSE             Dyck/grouping close — always followed by digit arg
+  [41]  MOD               modulus prefix      — always followed by digit arg
+  [42]  VAR               step output ref     — always followed by digit arg
+  [43]  INPUT             Model input
+  [44]  NAV_LEFT          left  / cycle-backward
+  [45]  NAV_RIGHT         right / cycle-forward
+  [46]  NAV_UP            up    / spatial-above
+  [47]  NAV_DOWN          down  / spatial-below
+  [48]  POP               a general delete replacing the STACK_POP
+
+SYSTEM (6 tokens):
+  [49]  PAD    sequence padding  — IGNORED in loss
+  [50]  SEP    separator: program/args boundary AND inline separator (was HASH_SEP+SEP)
+  [51]  YIELD  reading→writing boundary
+  [52]  THEN   step separator in multi-step programs
+  [53]  THINK  start planning phase (model receives ZERO inputs)
+  [54]  TASK   task identity prefix — always followed by digit arg
+
+NSL Sequence Format
+===================
+Single-step task:
+  @t [tokens | INPUT] # INPUT -> OUTPUT
+
+Multi-step program:
+  @t0 [tokens | INPUT] | @t1 [tokens | x_i | INPUT] # INPUT -> OUTPUT
+
+Think-step (planning) (during inference):
+  @t [input] ? N N N ... -> OUTPUT
+
+So a full sequence can look like this:
+
+@t0 [tokens | INPUT] |
+    @t1 [tokens | x_i | INPUT] #
+    INPUT ?
+    N N N ... ->
+    OUTPUT
+
+Loss Mask Rules
+===============
+These can be changed by the curriculum
+
+  PAD, TASK, D_t (task arg), input tokens  → No loss (allowed if BPTT)
+  THINK, ZERO (think phase)                → No loss (allowed if BPTT)
+  THEN, SEP                                → No loss (allowed if BPTT)
+  YIELD                                    → loss
+  OUTPUT tokens                            → loss
+
+Parameterized Token Pairs (op + digit arg)
+==========================================
+  OPEN  D_i   → Dyck/grouping open type i   (i in 0..15)
+  CLOSE D_i   → Dyck/grouping close type i  (i in 0..15)
+  MOD   D_n   → modulo by n                 (n in 1..31)
+  VAR   D_i   → output of step i            (i < current step)
+  TASK  D_t   → task identity t             (t in 0..31)
+
+NSL Text Format (human-readable ↔ token mapping)
+=================================================
+  0..31        → D0..D31
+  N            → ZERO
+  T            → TRUE
+  F            → FALSE
+  +  -  *  =   → OP_ADD  OP_SUB  OP_MUL  OP_EQ
+  [{i}  ]{i}   → OPEN D_i / CLOSE D_i        e.g. [0  ]1
+  %{n}         → MOD D_n                     e.g. %5
+  x{i}         → VAR D_i  (step i output)    e.g. x0  x21
+  a{i}         → INPUT D_i (argument i)      e.g. a0  a3
+  <            → NAV_LEFT  (left / backward)
+  >            → NAV_RIGHT (right / forward)
+  ^            → NAV_UP    (up / above)
+  v            → NAV_DOWN  (down / below)
+  $            → POP (a general delete replacing the STACK_POP)
+  _            → PAD
+  #            → SEP       (program/args boundary and inline separator)
+  ->           → YIELD
+  |            → THEN
+  ?            → THINK
+  @{t}         → TASK D_t                    e.g. @0  @5
 """
 
 import numpy as np
+from typing import List
 
-# -- Digit tokens: D0..D99 (token ID = digit value) --
-# Access as V.D(n) or just use the integer directly.
+# ---------------------------------------------------------------------------
+# DIGIT tokens [0..34]
+# ---------------------------------------------------------------------------
+ZERO  = 32   # structural null value (think-phase input)
+TRUE  = 33
+FALSE = 34
 
-PAD = 100
-BOS = 101
-EOS = 102
-SEP = 103
+_MAX_DIGIT = 32  # D0..D31
 
-# Task ID tokens
-TASK_0 = 104
-_NUM_TASK_SLOTS = 36
+def D(n: int) -> int:
+    """Digit token for value n (0..31). Token ID = value."""
+    assert 0 <= n < _MAX_DIGIT, f"Digit out of range: {n} (max {_MAX_DIGIT - 1})"
+    return n
 
-# Operators
-OP_ADD = 140
-OP_SUB = 141
-OP_MUL = 142
-OP_EQ = 143
+# ---------------------------------------------------------------------------
+# OPERATIONAL tokens [35..48]
+# ---------------------------------------------------------------------------
+OP_ADD    = 35
+OP_SUB    = 36
+OP_MUL    = 37
+OP_EQ     = 38
+OPEN      = 39   # Dyck/grouping open  — followed by D_i
+CLOSE     = 40   # Dyck/grouping close — followed by D_i
+MOD       = 41   # modulus — followed by D_n
+VAR       = 42   # step output ref — followed by D_i
+INPUT     = 43   # model input marker (standalone, no digit arg)
+NAV_LEFT  = 44   # left  / cycle-backward
+NAV_RIGHT = 45   # right / cycle-forward
+NAV_UP    = 46   # up    / spatial-above
+NAV_DOWN  = 47   # down  / spatial-below
+POP       = 48   # general delete (replaces STACK_POP)
 
-# Dyck bracket tokens: OPEN_i = 144 + i, CLOSE_i = 164 + i  (i in 0..19)
-_DYCK_OPEN_BASE = 144
-_DYCK_CLOSE_BASE = 164
-_MAX_DYCK_N = 20
+# Aliases
+STACK_POP = POP  # backward compat
+NAV_FWD = NAV_RIGHT
+NAV_BWD = NAV_LEFT
 
+# ---------------------------------------------------------------------------
+# SYSTEM tokens [49..54]
+# ---------------------------------------------------------------------------
+PAD   = 49   # sequence padding — ignored in loss
+SEP   = 50   # separator: program/args boundary AND inline (was HASH_SEP + SEP)
+YIELD = 51   # reading → writing boundary
+THEN  = 52   # step separator
+THINK = 53   # start planning phase
+TASK  = 54   # task identity prefix — followed by D_t
 
-def OPEN(i: int) -> int:
-    """Dyck open bracket for type i (0-indexed)."""
-    assert 0 <= i < _MAX_DYCK_N
-    return _DYCK_OPEN_BASE + i
+SIZE  = 55   # total vocabulary size
 
+# ---------------------------------------------------------------------------
+# Spatial / navigation direction constants
+# ---------------------------------------------------------------------------
+NAV_ABOVE = NAV_UP
+NAV_BELOW = NAV_DOWN
+# NAV_LEFT and NAV_RIGHT serve double duty for spatial left/right
 
-def CLOSE(i: int) -> int:
-    """Dyck close bracket for type i (0-indexed)."""
-    assert 0 <= i < _MAX_DYCK_N
-    return _DYCK_CLOSE_BASE + i
-
-
-VAR_X = 184
-OPEN_PAREN = 185
-CLOSE_PAREN = 186
-STACK_POP = 187
-NAV_FWD = 188
-NAV_BWD = 189
-HASH_SEP = 190
-
-TRUE = 191
-FALSE = 192
-
-PROG_ASSIGN = 193
-PROG_LOOP_START = 194
-PROG_LOOP_END = 195
-
-REL_ABOVE = 196
-REL_BELOW = 197
-REL_LEFT = 198
-REL_RIGHT = 199
-
-ZERO = 200
-
-SIZE = 201
-
-# ---- Task name registry (name -> index) ----
+# ---------------------------------------------------------------------------
+# Task registry: name → digit index for TASK D_t
+# ---------------------------------------------------------------------------
 TASK_NAMES = [
-    "parity_check",
-    "even_pairs",
-    "cycle_navigation",
-    "modular_arithmetic",
-    "dyck_n",
-    "reverse_string",
-    "stack_manipulation",
-    "nested_modular_arithmetic",
-    "solve_equation",
-    "binary_addition",
-    "binary_multiplication",
-    "duplicate_string",
-    "repeat_copy_n",
-    "odds_first",
-    "sort",
-    "square_root",
-    "count_n",
-    "n_back",
-    "associative_recall",
-    "missing_duplicate",
-    "deduplicate_inputs",
-    "python_execution",
-    "mini_shrdlu",
-    "shortest_path",
-    "mst_prim",
-    "graph_traversal",
-    "tsp",
-    "convex_hull",
-    "delaunay",
+    "parity_check",              # D0
+    "even_pairs",                # D1
+    "cycle_navigation",          # D2
+    "modular_arithmetic",        # D3
+    "dyck_n",                    # D4
+    "reverse_string",            # D5
+    "stack_manipulation",        # D6
+    "nested_modular_arithmetic", # D7
+    "duplicate_string",          # D8
+    "repeat_copy_n",             # D9
+    "odds_first",                # D10
+    "sort",                      # D11
+    "square_root",               # D12
+    "count_n",                   # D13
+    "n_back",                    # D14
+    "associative_recall",        # D15
+    "missing_duplicate",         # D16
+    "deduplicate_inputs",        # D17
+    "mini_shrdlu",               # D18
+    "shortest_path",             # D19
+    "mst_prim",                  # D20
+    "graph_traversal",           # D21
+    "tsp",                       # D22
+    "convex_hull",               # D23
+    "delaunay",                  # D24
+    # D25..D31 reserved for future tasks
 ]
 
 _TASK_NAME_TO_IDX = {name: i for i, name in enumerate(TASK_NAMES)}
+_MAX_TASK_SLOTS   = _MAX_DIGIT  # 32 task slots (D0..D31)
 
 
-def task_token(task_name: str) -> int:
-    """Return the TASK_N token for a given task name."""
-    return TASK_0 + _TASK_NAME_TO_IDX[task_name]
+def task_idx(task_name: str) -> int:
+    """Return digit index for task name (used as arg to TASK token)."""
+    if task_name not in _TASK_NAME_TO_IDX:
+        raise ValueError(f"Unknown task: '{task_name}'. Available: {TASK_NAMES}")
+    return _TASK_NAME_TO_IDX[task_name]
 
 
-def D(n: int) -> int:
-    """Digit token for value n. Identity function (token ID = value)."""
-    assert 0 <= n < 100
-    return n
+def task_prefix(task_name: str) -> List[int]:
+    """Return [TASK, D_i] token pair for a task name."""
+    return [TASK, D(task_idx(task_name))]
 
 
-def output_mask(task_name: str, **task_kwargs) -> np.ndarray:
-    """Bool array of shape (SIZE,). True where output token is valid."""
-    from . import tasks as _tasks
-    info_fn = _tasks.VOCAB_INFO[task_name]
-    info = info_fn(**task_kwargs)
-    return info["output_mask"]
+# ---------------------------------------------------------------------------
+# Token type classification
+# ---------------------------------------------------------------------------
+def token_type(t: int) -> str:
+    """Return the semantic type of a token: 'digit', 'operational', or 'system'."""
+    if 0 <= t <= 34:
+        return "digit"
+    elif 35 <= t <= 48:
+        return "operational"
+    elif 49 <= t <= 54:
+        return "system"
+    else:
+        raise ValueError(f"Token {t} out of vocabulary range [0..{SIZE-1}]")
 
 
-def decode(token_ids, *, compact: bool = False) -> list[str]:
-    """Human-readable decoding of token IDs."""
-    result = []
-    for t in token_ids:
-        t = int(t)
-        if 0 <= t <= 99:
-            result.append(f"D{t}" if not compact else str(t))
-        elif t == PAD:
-            result.append("<PAD>")
-        elif t == BOS:
-            result.append("<BOS>")
-        elif t == EOS:
-            result.append("<EOS>")
-        elif t == SEP:
-            result.append("<SEP>")
-        elif TASK_0 <= t < TASK_0 + _NUM_TASK_SLOTS:
-            idx = t - TASK_0
-            name = TASK_NAMES[idx] if idx < len(TASK_NAMES) else f"task_{idx}"
-            result.append(f"<TASK:{name}>")
-        elif t == OP_ADD:
-            result.append("+")
-        elif t == OP_SUB:
-            result.append("-")
-        elif t == OP_MUL:
-            result.append("*")
-        elif t == OP_EQ:
-            result.append("=")
-        elif _DYCK_OPEN_BASE <= t < _DYCK_CLOSE_BASE:
-            result.append(f"OPEN_{t - _DYCK_OPEN_BASE}")
-        elif _DYCK_CLOSE_BASE <= t < _DYCK_CLOSE_BASE + _MAX_DYCK_N:
-            result.append(f"CLOSE_{t - _DYCK_CLOSE_BASE}")
-        elif t == VAR_X:
-            result.append("x")
-        elif t == OPEN_PAREN:
-            result.append("(")
-        elif t == CLOSE_PAREN:
-            result.append(")")
-        elif t == STACK_POP:
-            result.append("POP")
-        elif t == NAV_FWD:
-            result.append("FWD")
-        elif t == NAV_BWD:
-            result.append("BWD")
-        elif t == HASH_SEP:
-            result.append("#")
-        elif t == TRUE:
-            result.append("TRUE")
-        elif t == FALSE:
-            result.append("FALSE")
-        elif t == PROG_ASSIGN:
-            result.append("ASSIGN")
-        elif t == PROG_LOOP_START:
-            result.append("LOOP_START")
-        elif t == PROG_LOOP_END:
-            result.append("LOOP_END")
-        elif t == REL_ABOVE:
-            result.append("ABOVE")
-        elif t == REL_BELOW:
-            result.append("BELOW")
-        elif t == REL_LEFT:
-            result.append("LEFT")
-        elif t == REL_RIGHT:
-            result.append("RIGHT")
+# ---------------------------------------------------------------------------
+# Decode / display
+# ---------------------------------------------------------------------------
+_DIGIT_STR = {
+    **{i: f"D{i}" for i in range(_MAX_DIGIT)},
+    ZERO:  "ZERO",
+    TRUE:  "TRUE",
+    FALSE: "FALSE",
+}
+
+_OPERATIONAL_STR = {
+    OP_ADD:    "+",
+    OP_SUB:    "-",
+    OP_MUL:    "*",
+    OP_EQ:     "=",
+    OPEN:      "<OPEN>",
+    CLOSE:     "<CLOSE>",
+    MOD:       "<M>",
+    VAR:       "<VAR>",
+    INPUT:     "INPUT",
+    NAV_LEFT:  "<",
+    NAV_RIGHT: ">",
+    NAV_UP:    "^",
+    NAV_DOWN:  "v",
+    POP:       "$",
+}
+
+_SYSTEM_STR = {
+    PAD:   "<PAD>",
+    SEP:   "#",
+    YIELD: "->",
+    THEN:  "|",
+    THINK: "?",
+    TASK:  "@",
+}
+
+_ALL_STR = {**_DIGIT_STR, **_OPERATIONAL_STR, **_SYSTEM_STR}
+
+# Tokens that consume the next digit as an argument (parameterized pairs)
+_PAIR_HEADS = {OPEN, CLOSE, MOD, VAR, TASK}
+
+
+def pretty(token_ids, *, skip_pad: bool = True) -> str:
+    """Format token IDs as NSL text (parameterized pairs collapsed).
+
+    Parameterized pairs are collapsed into single symbols:
+      TASK D_t  → @t      OPEN D_i  → [i      CLOSE D_i → ]i
+      MOD  D_n  → %n      VAR  D_i  → x{i}
+
+    Single tokens use compact NSL text format:
+      0-31 → digit value  N=ZERO  T=TRUE  F=FALSE
+      + - * =   INPUT   < > ^ v   $   _ # -> | ? @
+
+    Args:
+        token_ids: Iterable of integer token IDs.
+        skip_pad: If True (default), PAD tokens are omitted from output.
+
+    Returns:
+        Space-separated NSL text string.
+    """
+    tokens = [int(t) for t in token_ids]
+    parts = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+
+        if t == PAD:
+            if not skip_pad:
+                parts.append("_")
+            i += 1
+            continue
+
+        if t in _PAIR_HEADS:
+            # Consume next token as digit arg
+            if i + 1 < len(tokens):
+                arg = tokens[i + 1]
+                n = arg  # digit tokens have ID == value
+                if t == TASK:
+                    parts.append(f"@{n}")
+                elif t == OPEN:
+                    parts.append(f"[{n}")
+                elif t == CLOSE:
+                    parts.append(f"]{n}")
+                elif t == MOD:
+                    parts.append(f"%{n}")
+                elif t == VAR:
+                    parts.append(f"x{n}")
+                i += 2
+            else:
+                # Dangling pair head at end of sequence
+                parts.append(_ALL_STR.get(t, f"<UNK:{t}>"))
+                i += 1
+            continue
+
+        # Single tokens — compact NSL text
+        if 0 <= t < _MAX_DIGIT:
+            parts.append(str(t))
         elif t == ZERO:
-            result.append("<ZERO>")
+            parts.append("N")
+        elif t == TRUE:
+            parts.append("T")
+        elif t == FALSE:
+            parts.append("F")
+        elif t == OP_ADD:
+            parts.append("+")
+        elif t == OP_SUB:
+            parts.append("-")
+        elif t == OP_MUL:
+            parts.append("*")
+        elif t == OP_EQ:
+            parts.append("=")
+        elif t == NAV_LEFT:
+            parts.append("<")
+        elif t == NAV_RIGHT:
+            parts.append(">")
+        elif t == NAV_UP:
+            parts.append("^")
+        elif t == NAV_DOWN:
+            parts.append("v")
+        elif t == INPUT:
+            parts.append("INPUT")
+        elif t == POP:
+            parts.append("$")
+        elif t == SEP:
+            parts.append("#")
+        elif t == YIELD:
+            parts.append("->")
+        elif t == THEN:
+            parts.append("|")
+        elif t == THINK:
+            parts.append("?")
         else:
-            result.append(f"<UNK:{t}>")
-    return result
+            parts.append(f"<UNK:{t}>")
+
+        i += 1
+
+    return " ".join(parts)
 
 
-def _make_mask(token_ids) -> np.ndarray:
+def make_mask(token_ids) -> np.ndarray:
     """Create a boolean output mask from a set/list of valid token IDs."""
     mask = np.zeros(SIZE, dtype=bool)
     for t in token_ids:
-        mask[t] = True
+        mask[int(t)] = True
     return mask
+
+
+def describe() -> str:
+    """Print a summary of the vocabulary."""
+    lines = [
+        f"NSL Vocabulary — {SIZE} tokens",
+        f"  DIGIT      ({34 - 0 + 1} tokens): D0..D31, ZERO, TRUE, FALSE   [IDs 0..34]",
+        f"  OPERATIONAL({48 - 35 + 1} tokens): operators, nav, family tokens [IDs 35..48]",
+        f"  SYSTEM     ({54 - 49 + 1} tokens): PAD SEP YIELD THEN THINK TASK [IDs 49..54]",
+        f"  Tasks registered: {len(TASK_NAMES)} / {_MAX_TASK_SLOTS} slots",
+    ]
+    return "\n".join(lines)

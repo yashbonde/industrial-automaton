@@ -1,46 +1,195 @@
 # this is the default way of interacting with the industrial automaton codebase
 
-import time
 import inspect
 import numpy as np
 from typing import Any
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 
 from industrial_automaton.utils import ANSI
-from industrial_automaton.models.baby_ntm import BabyNTM, BabyNTMModelConfig
-from industrial_automaton.models.suzgun_stack_rnn import SuzgunStackRNN, SuzgunStackRNNConfig
-from industrial_automaton.models.tape_rnn import TapeRNN, TapeRNNConfig
-from industrial_automaton.models.transformer import Transformer, TransformerConfig
-from industrial_automaton.models.lstm import LSTM, LSTMConfig
-from industrial_automaton.vocab import SIZE as VOCAB_SIZE, ZERO, PAD
+from industrial_automaton.models import (
+    BabyNTM, BabyNTMModelConfig,
+    SuzgunStackRNN, SuzgunStackRNNConfig,
+    TapeRNN, TapeRNNConfig,
+    Transformer, TransformerConfig,
+    LSTM, LSTMConfig,
+    ModelPipeline,
+)
+from industrial_automaton.vocab import SIZE as VOCAB_SIZE
 from industrial_automaton import tasks
+from industrial_automaton.tasks import generate_variable_dataset, create_batch_iterator
+from industrial_automaton.tasks.generators import create_online_batch_generator
+from industrial_automaton.curriculum import (
+    FixedCurriculum,
+    LinearCurriculum,
+    AdaptiveCurriculum,
+    MultiTaskCurriculum,
+    UniformCurriculum,
+)
+
+
+def _build_task_data(task_name_clean, settings, task_kwargs, eval_kwargs=None):
+    """Build training + eval datasets for a single task. Returns (task_fn, train_data, eval_data, task_metadata)."""
+    from industrial_automaton.tasks import MASTER_REGISTRY
+
+    task_fn = partial(
+        getattr(tasks, f"generate_{task_name_clean}"),
+        **task_kwargs
+    )
+    sig = inspect.signature(task_fn.func)
+    example_kwargs = {"batch_size": 1}
+    task_entry = MASTER_REGISTRY.get(task_name_clean)
+    if task_entry and task_entry.baseline:
+        example_kwargs.update(task_entry.baseline)
+        if "length" not in example_kwargs and "length" in sig.parameters:
+            example_kwargs["length"] = settings.max_seqlen
+    elif "length" in sig.parameters:
+        example_kwargs["length"] = settings.max_seqlen
+
+    train_kw = task_kwargs.copy()
+    if settings.task_kwargs:
+        train_kw.update(settings.task_kwargs)
+    train_inputs, train_targets, train_loss_mask = generate_variable_dataset(
+        task_fn, train_kw, settings.dataset_size, settings.max_seqlen,
+        hard_array_limit=settings.hard_array_limit, task_name=task_name_clean,
+    )
+
+    eval_kw = (eval_kwargs or task_kwargs).copy()
+    if settings.eval_task_kwargs:
+        eval_kw.update(settings.eval_task_kwargs)
+    eval_inputs, eval_targets, eval_loss_mask = generate_variable_dataset(
+        task_fn, eval_kw, settings.eval_dataset_size, settings.eval_max_seqlen,
+        hard_array_limit=settings.hard_array_limit, task_name=task_name_clean,
+    )
+
+    task_metadata = None
+    if task_entry is not None and task_entry.output_vocab is not None:
+        task_metadata = {"output_vocab": task_entry.output_vocab}
+
+    return task_fn, (train_inputs, train_targets, train_loss_mask), (eval_inputs, eval_targets, eval_loss_mask), task_metadata
+
+
+def _round_robin_iterator(iterators):
+    """Yield batches in round-robin order across multiple iterators."""
+    while True:
+        for it in iterators:
+            yield next(it)
 
 
 def cli():
     # Import here to not mess up other CLI commands
-    from industrial_automaton.config import settings
-    from industrial_automaton.trainer import JAXTrainer
+    from industrial_automaton.config import Settings
+    from industrial_automaton.tasks import MASTER_REGISTRY
+    from industrial_automaton.trainer import Trainer, loss_fn, TrainingDivergedError, eval_fn
+
+    # Create settings instance (will parse CLI args automatically)
+    settings = Settings()
 
     # pretty print all the settings
     print("="*20 + f" {ANSI.bold('Settings')} " + "="*20)
-    for k, v in settings.model_dump().items():
+    for k, v in sorted(settings.model_dump().items()):
         print(f"{ANSI.blue(k)}: {ANSI.italic(v)}")
     print("="*50)
 
+    # --- Multi-task path ---
+    if settings.tasks:
+        task_names = [t.strip().replace("generate_", "") for t in settings.tasks.split(",")]
+        print(f"     {ANSI.bold('Multi-task')}: {task_names}")
+
+        all_train_iters = []
+        all_eval_data = []
+        all_task_metadata = []
+
+        for tname in task_names:
+            tk = {"rng": np.random.default_rng(settings.seed)}
+            _, train_data, eval_data, tmeta = _build_task_data(tname, settings, tk)
+            ti, tt, tm = train_data
+            print(f"{ANSI.blue(f'  [{tname}]')}: train={ti.shape}, eval={eval_data[0].shape}")
+            all_train_iters.append(create_batch_iterator(ti, tt, tm, batch_size=settings.batch_size, shuffle=True, seed=settings.seed))
+            all_eval_data.append((tname, eval_data, tmeta))
+            all_task_metadata.append(tmeta)
+
+        combined_iter = _round_robin_iterator(all_train_iters)
+        # Use first task's eval for Trainer's built-in early stopping
+        first_eval_inputs, first_eval_targets, first_eval_mask = all_eval_data[0][1]
+        first_task_meta = all_task_metadata[0]
+
+        # Build model (shared across all tasks)
+        config_cls, model_cls = {
+            "baby_ntm": (BabyNTMModelConfig, BabyNTM),
+            "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
+            "tape_rnn": (TapeRNNConfig, TapeRNN),
+            "transformer": (TransformerConfig, Transformer),
+            "lstm": (LSTMConfig, LSTM),
+        }.get(settings.model, (None, None))
+        if config_cls is None:
+            raise ValueError(f"Unknown model: {settings.model}")
+        model_kwargs = settings.model_kwargs.copy()
+        if settings.embedding_type == "one_hot":
+            model_kwargs["embedding_dim"] = VOCAB_SIZE
+        config = config_cls(**model_kwargs)
+        model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
+        num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
+        print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+
+        trainer = Trainer(
+            model, settings,
+            task_metadata=first_task_meta,
+            eval_inputs=first_eval_inputs,
+            eval_labels=first_eval_targets,
+            eval_loss_mask=first_eval_mask,
+            eval_dataset_size=settings.eval_dataset_size,
+        )
+
+        print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
+        try:
+            history = trainer.fit(data_generator=combined_iter)
+        except TrainingDivergedError as e:
+            print(f"{ANSI.red('Training diverged: ' + str(e))}")
+            return
+
+        print("\n" + "="*50)
+        # Per-task evaluation
+        print(f"{ANSI.bold('Per-task evaluation:')}")
+        for tname, (ei, et, em), tmeta in all_eval_data:
+            metrics = eval_fn(trainer.state.model, settings.eval_dataset_size, ei, et, em, task_metadata=tmeta)
+            tok_acc = float(metrics.aux["token_accuracy"])
+            seq_acc = float(metrics.aux["sequence_accuracy"])
+            print(f"  {ANSI.blue(tname)}: tok_acc={tok_acc:.4f} | seq_acc={seq_acc:.4f}")
+            print(f"Final token accuracy [{tname}]: {tok_acc:.4f}")
+            print(f"Final sequence accuracy [{tname}]: {seq_acc:.4f}")
+        return
+
+    # --- Single-task path (original) ---
     # Generate a single example
     print(f"     {ANSI.bold('Task')}: {settings.task}")
+    task_name_clean = settings.task.replace("generate_", "")  # Remove prefix if present
     task_kwargs: dict[str, Any] = {"rng": np.random.default_rng(settings.seed)}
-    if settings.n is not None:
-        task_kwargs["n"] = settings.n
 
     task_fn = partial(
-        getattr(tasks, f"generate_{settings.task}"),
+        getattr(tasks, f"generate_{task_name_clean}"),
         **task_kwargs
     )
-    example = task_fn(batch_size=1, length=10)
+
+    # Check if the task function accepts a 'length' parameter and set example_kwargs
+    sig = inspect.signature(task_fn.func) # Get signature from the wrapped function
+    example_kwargs = {"batch_size": 1}
+
+    task_entry = MASTER_REGISTRY.get(task_name_clean)
+    if task_entry and task_entry.baseline:
+        example_kwargs.update(task_entry.baseline)
+        # Ensure 'length' is present, fallback to a reasonable default if not in baseline
+        if 'length' not in example_kwargs and "length" in sig.parameters:
+            example_kwargs['length'] = settings.max_seqlen # Use a default from settings if task has length param
+    elif "length" in sig.parameters:
+        example_kwargs["length"] = settings.max_seqlen # Fallback if no task_entry or baseline
+
+    # Special handling for modular_arithmetic example length if it somehow ends up even
+    if task_name_clean == 'modular_arithmetic' and 'length' in example_kwargs and example_kwargs['length'] % 2 == 0:
+        example_kwargs['length'] += 1
+
+    example = task_fn(**example_kwargs)
 
     # Print the example
     print(f"{ANSI.bold('Formatted')}: {example['input_formatted'][0]} -> {example['output_formatted'][0]}")
@@ -50,7 +199,6 @@ def cli():
     print("\n" + "="*20 + f" {ANSI.bold('Training')} " + "="*20)
 
     # Prepare model config
-    from industrial_automaton.vocab import SIZE as VOCAB_SIZE, PAD, ZERO
     print(f"{ANSI.blue('Vocab size')}: {VOCAB_SIZE}")
 
     # Initialize model based on settings
@@ -67,228 +215,256 @@ def cli():
     # Handle Transformer max_seq_len specifically
     model_kwargs = settings.model_kwargs.copy()
     if settings.model == "transformer" and "max_seq_len" not in model_kwargs:
-        model_kwargs["max_seq_len"] = max(settings.tr_max_seqlen, settings.tr_eval_max_seqlen) * 2
+        model_kwargs["max_seq_len"] = max(settings.max_seqlen, settings.eval_max_seqlen) * 2
+
+    # handle embedding dim for one_hot
+    if settings.embedding_type == "one_hot":
+        print(f"{ANSI.blue('Using one_hot embedding. Embedding dimension set to vocab size: ' + str(VOCAB_SIZE))}")
+        model_kwargs["embedding_dim"] = VOCAB_SIZE
 
     config = config_cls(**model_kwargs)
-    model = model_cls(config, key=jax.random.PRNGKey(settings.seed))
-    print(f"{ANSI.green('Model')}: {settings.model} {config.model_dump()}")
+    model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
+    num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
+    print(f"{ANSI.green('Model')} (via Pipeline): {settings.model}")
+    print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
 
-    # Define loss function
-    def loss_fn(model, batch, key):
-        inputs_np, labels_np = batch
-        inputs = jax.nn.one_hot(jnp.array(inputs_np), VOCAB_SIZE)
-        labels = jnp.array(labels_np)
-
-        # Detect if it's classification (scalar label) or sequence (vector label)
-        is_sequence = labels.ndim == 2
-        
-        def single_example(inp, lab):
-            state = model.init_state()
-            outputs, _ = model(inp, state) # (T, vocab)
-            
-            if is_sequence:
-                # Sequence Cross Entropy with Masking
-                log_probs = jax.nn.log_softmax(outputs, axis=-1)
-                # Select log_probs for the correct labels
-                target_log_probs = jnp.take_along_axis(log_probs, lab[:, None], axis=-1).squeeze(-1)
-                
-                # Mask out PAD tokens
-                mask = (lab != PAD)
-                denom = jnp.sum(mask) + 1e-6
-                
-                loss = -jnp.sum(target_log_probs * mask) / denom
-                
-                # Accuracy only on non-padded tokens
-                correct = (jnp.argmax(outputs, axis=-1) == lab)
-                accuracy = jnp.sum(correct * mask) / denom
-            else:
-                # Scalar Classification (Binary)
-                pred_logit = outputs[-1, 1] - outputs[-1, 0] if VOCAB_SIZE > 1 else outputs[-1, 0]
-                pred = jax.nn.sigmoid(pred_logit)
-                loss = -lab * jnp.log(pred + 1e-7) - (1 - lab) * jnp.log(1 - pred + 1e-7)
-                accuracy = (pred > 0.5).astype(jnp.float32) == lab
-            
-            return loss, accuracy
-
-        losses, accuracies = jax.vmap(single_example)(inputs, labels)
-        loss = jnp.mean(losses)
-        accuracy = jnp.mean(accuracies)
-
-        return loss, {"accuracy": accuracy}
-
-    # --- Dataset Generation Helper ---
-    def generate_variable_dataset(
-        base_task_fn, 
-        base_kwargs, 
-        num_examples, 
-        max_seqlen_param, 
-        min_seqlen_param=5
-    ):
-        """Generates a dataset with variable lengths up to max_seqlen_param."""
-        chunk_size = 64
-        num_chunks = int(np.ceil(num_examples / chunk_size))
-        
-        all_inputs = []
-        all_labels = []
-        
-        max_in_width = 0
-        max_out_width = 0
-        
-        print(f"Generating {num_examples} examples with lengths {min_seqlen_param}-{max_seqlen_param}...")
-        
-        for _ in range(num_chunks):
-            # Pick a random length for this chunk
-            l = np.random.randint(min_seqlen_param, max_seqlen_param + 1)
-            
-            # Generate
-            data = base_task_fn(batch_size=chunk_size, length=l, **base_kwargs)
-            inp, out = data["input"], data["output"]
-            
-            # Determine widths
-            in_w = inp.shape[1]
-            out_w = out.shape[1]
-            
-            # Structural Padding (ZERO) if needed for this chunk
-            # e.g. duplicate_string: in=L, out=2L. We need in to be 2L with ZEROs.
-            needed_in_width = max(in_w, out_w)
-            if in_w < needed_in_width:
-                 padding = np.full((chunk_size, needed_in_width - in_w), ZERO, dtype=inp.dtype)
-                 inp = np.concatenate([inp, padding], axis=1)
-                 in_w = needed_in_width
-            
-            # Update global max widths
-            max_in_width = max(max_in_width, in_w)
-            max_out_width = max(max_out_width, out_w)
-            
-            all_inputs.append(inp)
-            all_labels.append(out)
-            
-        # Determine final unified width (usually input and output should match for seq-to-seq models to run)
-        final_width = max(max_in_width, max_out_width)
-        
-        # Collate and Pad to final_width with PAD
-        total_inputs = np.full((num_chunks * chunk_size, final_width), PAD, dtype=np.int64)
-        total_labels = np.full((num_chunks * chunk_size, final_width), PAD, dtype=np.int64)
-        
-        cursor = 0
-        for inp, out in zip(all_inputs, all_labels):
-            n = inp.shape[0]
-            w_in = inp.shape[1]
-            w_out = out.shape[1]
-            
-            # Copy input (already structurally padded with ZERO if needed)
-            total_inputs[cursor:cursor+n, :w_in] = inp
-            
-            # Copy output
-            total_labels[cursor:cursor+n, :w_out] = out
-            
-            cursor += n
-            
-        return total_inputs[:num_examples], total_labels[:num_examples]
-
+    # --- Dataset Generation ---
     # Generate Training Data
     print(f"{ANSI.blue('Generating training dataset...')}")
-    train_dataset_size = 10000
     train_kwargs = task_kwargs.copy()
-    if settings.tr_task_kwargs:
-        train_kwargs.update(settings.tr_task_kwargs)
-        
-    train_inputs, train_labels = generate_variable_dataset(
-        task_fn, 
-        train_kwargs, 
-        train_dataset_size, 
-        settings.tr_max_seqlen
+    if settings.task_kwargs:
+        train_kwargs.update(settings.task_kwargs)
+
+    train_inputs, train_targets, train_loss_mask = generate_variable_dataset(
+        task_fn,
+        train_kwargs,
+        settings.dataset_size,
+        settings.max_seqlen,
+        hard_array_limit=settings.hard_array_limit,
+        task_name=task_name_clean,
     )
-    print(f"{ANSI.blue('Train Dataset')}: {train_inputs.shape} -> {train_labels.shape}")
+    print(f"{ANSI.blue('Train Dataset')}: inputs={train_inputs.shape} targets={train_targets.shape} mask={train_loss_mask.shape}")
 
     # Generate Evaluation Data
     print(f"{ANSI.blue('Generating evaluation dataset...')}")
-    eval_dataset_size = 1000
     eval_kwargs = task_kwargs.copy()
-    if settings.tr_eval_task_kwargs:
-        eval_kwargs.update(settings.tr_eval_task_kwargs)
-        
-    eval_inputs, eval_labels = generate_variable_dataset(
-        task_fn, 
-        eval_kwargs, 
-        eval_dataset_size, 
-        settings.tr_eval_max_seqlen
-    )
-    print(f"{ANSI.blue('Eval Dataset')}: {eval_inputs.shape} -> {eval_labels.shape}")
+    if settings.eval_task_kwargs:
+        eval_kwargs.update(settings.eval_task_kwargs)
 
-    train_batch_size = 32
-    # Create RNG for shuffling (using the same seed for full reproducibility)
-    shuffle_rng = np.random.default_rng(settings.seed)
+    eval_inputs, eval_targets, eval_loss_mask = generate_variable_dataset(
+        task_fn,
+        eval_kwargs,
+        settings.eval_dataset_size,
+        settings.eval_max_seqlen,
+        hard_array_limit=settings.hard_array_limit,
+        task_name=task_name_clean,
+    )
+    print(f"{ANSI.blue('Eval Dataset')}: inputs={eval_inputs.shape} targets={eval_targets.shape} mask={eval_loss_mask.shape}")
 
     # Create data iterator that yields batches from the fixed dataset
-    def data_iterator():
-        """Iterator that yields batches from the fixed dataset, shuffling after each epoch."""
-        num_batches = train_dataset_size // train_batch_size
-        indices = np.arange(train_dataset_size)
+    data_iterator = create_batch_iterator(
+        train_inputs,
+        train_targets,
+        train_loss_mask,
+        batch_size=settings.batch_size,
+        shuffle=True,
+        seed=settings.seed,
+    )
 
-        while True:
-            # Shuffle at the start of each epoch using the seeded RNG
-            shuffle_rng.shuffle(indices)
+    # Initialize curriculum strategy if specified
+    curriculum = None
+    if settings.curriculum_type:
+        curriculum_kwargs = settings.curriculum_kwargs or {}
 
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * train_batch_size
-                end_idx = start_idx + train_batch_size
-                batch_indices = indices[start_idx:end_idx]
+        if settings.curriculum_type == "fixed":
+            # Fixed curriculum - no adaptation
+            fixed_params = curriculum_kwargs.get("fixed_params", {"length": settings.max_seqlen})
+            curriculum = FixedCurriculum(fixed_params=fixed_params)
+            print(f"{ANSI.blue('Curriculum')}: Fixed - {fixed_params}")
 
-                batch_inputs = train_inputs[batch_indices]
-                batch_labels = train_labels[batch_indices]
+        elif settings.curriculum_type == "linear":
+            # Linear curriculum - increase difficulty linearly
+            initial_bound = curriculum_kwargs.get("initial_bound", 10)
+            increase_freq = curriculum_kwargs.get("increase_freq", 500)
+            increase_amount = curriculum_kwargs.get("increase_amount", 5)
+            curriculum = LinearCurriculum(
+                initial_bound=initial_bound,
+                max_bound=settings.max_seqlen,
+                increase_freq=increase_freq,
+                increase_amount=increase_amount,
+            )
+            print(f"{ANSI.blue('Curriculum')}: Linear - start={initial_bound}, max={settings.max_seqlen}, freq={increase_freq}, amount={increase_amount}")
 
-                yield (batch_inputs, batch_labels)
+        elif settings.curriculum_type == "adaptive":
+            # Adaptive curriculum - performance-based
+            advance_threshold = curriculum_kwargs.get("advance_threshold", 0.9)
+            advance_streak = curriculum_kwargs.get("advance_streak", 3)
+            backoff_threshold = curriculum_kwargs.get("backoff_threshold", 2.0)
+            ema_decay = curriculum_kwargs.get("ema_decay", 0.9)
+            step_size = curriculum_kwargs.get("step_size", 5)
+            curriculum = AdaptiveCurriculum(
+                advance_threshold=advance_threshold,
+                advance_streak=advance_streak,
+                backoff_threshold=backoff_threshold,
+                ema_decay=ema_decay,
+                step_size=step_size,
+            )
+            print(f"{ANSI.blue('Curriculum')}: Adaptive - advance_threshold={advance_threshold}, streak={advance_streak}, backoff={backoff_threshold}, ema={ema_decay}")
 
-    # Eval Function
-    def eval_loop(model):
-        """Runs evaluation on the fixed eval dataset."""
-        # Run in larger batches for speed, but watch memory
-        eval_batch_size = 128
-        num_batches = int(np.ceil(eval_dataset_size / eval_batch_size))
-        
-        total_loss = 0.0
-        total_acc = 0.0
-        
-        # JIT the single batch eval
-        @jax.jit
-        def eval_batch(m, inp, lab):
-            return loss_fn(m, (inp, lab), jax.random.PRNGKey(0)) # Key doesn't matter for eval usually
-            
-        for i in range(num_batches):
-            start = i * eval_batch_size
-            end = min(start + eval_batch_size, eval_dataset_size)
-            if start >= end: break
-            
-            b_in = eval_inputs[start:end]
-            b_lbl = eval_labels[start:end]
-            
-            l, metrics = eval_batch(model, b_in, b_lbl)
-            total_loss += float(l) * (end - start)
-            total_acc += float(metrics["accuracy"]) * (end - start)
-            
-        avg_loss = total_loss / eval_dataset_size
-        avg_acc = total_acc / eval_dataset_size
-        
-        # Return StepMetrics compatible with trainer
-        from industrial_automaton.trainer import StepMetrics
-        return StepMetrics(loss=jnp.array(avg_loss), accuracy=jnp.array(avg_acc))
+        elif settings.curriculum_type == "multitask":
+            # Multi-task curriculum
+            task_names = curriculum_kwargs.get("task_names", [])
+            if not task_names:
+                raise ValueError("MultiTaskCurriculum requires 'task_names' in curriculum_kwargs")
+            selection_mode = curriculum_kwargs.get("selection_mode", "first_unsolved")
+            mastery_threshold = curriculum_kwargs.get("mastery_threshold", 0.95)
+            mastered_revisit_ratio = curriculum_kwargs.get("mastered_revisit_ratio", 0.05)
+            curriculum = MultiTaskCurriculum(
+                task_names=task_names,
+                selection_mode=selection_mode,
+                mastery_threshold=mastery_threshold,
+                mastered_revisit_ratio=mastered_revisit_ratio,
+            )
+            print(f"{ANSI.blue('Curriculum')}: MultiTask - tasks={task_names}, mode={selection_mode}")
+
+        elif settings.curriculum_type == "uniform":
+            # Uniform curriculum - sample length uniformly each step (Delétang et al. 2023)
+            min_len = curriculum_kwargs.get("min_bound", 1)
+            curriculum = UniformCurriculum()
+            print(f"{ANSI.blue('Curriculum')}: Uniform - lengths {min_len}-{settings.max_seqlen} (online generation)")
+
+        else:
+            raise ValueError(f"Unknown curriculum_type: {settings.curriculum_type}. Choose from: fixed, linear, adaptive, multitask, uniform")
+
+    # Build task_metadata with output_vocab mask for logit masking
+    task_metadata = None
+    if task_entry is not None and task_entry.output_vocab is not None:
+        task_metadata = {"output_vocab": task_entry.output_vocab}
+
+    # Length-varying curricula (uniform, linear, adaptive) all need online generation —
+    # the dataset length changes every eval, so we can't pre-generate a fixed dataset.
+    # Only fixed/multitask curricula (or no curriculum) use the pre-generated iterator.
+    use_online = settings.curriculum_type in ("uniform", "linear", "adaptive")
+
+    if use_online:
+        # Online generator: callable (length) -> batch, used by trainer each step
+        data_source = create_online_batch_generator(
+            task_fn,
+            train_kwargs,
+            batch_size=settings.batch_size,
+            hard_array_limit=settings.hard_array_limit,
+            task_name=task_name_clean,
+        )
+        # Initialize curriculum state — max_seqlen is the starting (min) length for
+        # adaptive/linear; the curriculum grows it up to the task's natural max.
+        min_len = (settings.curriculum_kwargs or {}).get("min_bound", settings.max_seqlen)
+        max_len = (settings.curriculum_kwargs or {}).get("max_bound", settings.max_seqlen)
+        from industrial_automaton.curriculum import init_curriculum_state
+        curriculum_state = init_curriculum_state(
+            strategy=curriculum,
+            min_bound=min_len,
+            max_bound=max_len,
+            initial_bound=min_len,
+        )
+        print(f"{ANSI.blue('Curriculum')}: online generation, "
+              f"L={min_len}→{max_len}, type={settings.curriculum_type}")
+    else:
+        data_source = data_iterator
+        curriculum_state = None
 
     # Initialize trainer
-    trainer = JAXTrainer(model, loss_fn, settings)
+    trainer = Trainer(
+        model,
+        settings,
+        task_metadata=task_metadata,
+        curriculum=curriculum,
+        eval_inputs=eval_inputs,
+        eval_labels=eval_targets,
+        eval_loss_mask=eval_loss_mask,
+        eval_dataset_size=settings.eval_dataset_size,
+    )
+
+    # Inject pre-built curriculum state for curricula that need it
+    if use_online and curriculum_state is not None:
+        import equinox as eqx
+        trainer.state = eqx.tree_at(
+            lambda s: s.curriculum_state,
+            trainer.state,
+            curriculum_state,
+        )
 
     # Train
     print(f"{ANSI.bold('Starting training...')}")
-    history = trainer.fit(
-        data_generator=data_iterator(),
-        eval_fn=eval_loop
-    )
+    try:
+        history = trainer.fit(
+            data_generator=data_source,
+        )
 
-    print("\n" + "="*50)
-    print(f"{ANSI.green('Training complete!')}")
-    print(f"Final loss: {float(history[-1].loss):.4f}")
-    if history[-1].accuracy is not None:
-        print(f"Final accuracy: {float(history[-1].accuracy):.4f}")
+        print("\n" + "="*50)
+    
+        # Add 5 examples of actual random I/O for the model. I want to see what
+        # the model sees and predicts.
+
+        print(f"{ANSI.green('Training complete!')}")
+        print(f"Final loss: {float(history[-1].loss):.4f}")
+        if history[-1].aux:
+            tok_acc = history[-1].aux.get("token_accuracy")
+            seq_acc = history[-1].aux.get("sequence_accuracy")
+            if tok_acc is not None:
+                print(f"Final token accuracy: {float(tok_acc):.4f}")
+            if seq_acc is not None:
+                print(f"Final sequence accuracy: {float(seq_acc):.4f}")
+
+        # Add 5 examples of actual random I/O for the model. I want to see what
+        # the model sees and predicts.
+        from industrial_automaton.vocab import pretty, YIELD, PAD
+        import jax.numpy as jnp
+
+        print("\n" + "="*15 + f" {ANSI.bold('Model Predictions (Eval Set)')} " + "="*15)
+        # Sample 5 random indices from eval set
+        indices = np.random.choice(len(eval_inputs), size=min(3, len(eval_inputs)), replace=False)
+        for i, idx in enumerate(indices):
+            x_raw = eval_inputs[idx]
+            tgt_raw = eval_targets[idx]
+            mask_raw = eval_loss_mask[idx]
+
+            # Run inference
+            state = trainer.state.model.init_state()
+            logits, _ = trainer.state.model(x_raw, state)
+            preds = jnp.argmax(logits, axis=-1)
+
+            # Find YIELD position to split input/output display
+            x_list = [int(t) for t in x_raw if int(t) != PAD]
+            yield_pos = next((j for j, t in enumerate(x_list) if t == YIELD), len(x_list))
+            inp_str = pretty(x_list[:yield_pos])
+
+            # Show target and pred only where mask=1
+            mask_positions = np.where(mask_raw == 1)[0]
+            if len(mask_positions) > 0:
+                tgt_tokens = [int(tgt_raw[p]) for p in mask_positions]
+                pred_tokens = [int(preds[p]) for p in mask_positions]
+                tgt_str = pretty(tgt_tokens)
+                pred_str = pretty(pred_tokens)
+            else:
+                tgt_str = "(none)"
+                pred_str = "(none)"
+
+            print(f"\n{ANSI.bold(f'Example {i+1}:')}")
+            print(f"  {ANSI.blue('Input')}:  {inp_str}")
+            print(f"  {ANSI.green('Target')}: {tgt_str}")
+            print(f"  {ANSI.red('Pred')}:   {pred_str}")
+        print("\n" + "="*50)
+    except TrainingDivergedError as e:
+        print("\n" + "="*50)
+        print(f"{ANSI.red('Training diverged!')}")
+        print(f"{ANSI.red(f'Error: {str(e)}')}")
+        print(f"Task: {settings.task}")
+        print(f"Model: {settings.model}")
+        print("Consider:")
+        print("  - Reducing learning rate")
+        print("  - Adjusting model capacity")
+        print("  - Checking task constraints")
+        return
 
 
 
@@ -362,3 +538,45 @@ def print_task_configs():
 
     print("\n" + "="*60)
     print(f"Usage: uv run inmaton --task <name> -n <n>")
+
+def print_curriculum_configs():
+    import dataclasses
+
+    print("="*20 + f" {ANSI.bold('Curriculum Configurations')} " + "="*20)
+    print(f"Legend: {ANSI.red('*')} = Required field")
+
+    curriculum_configs = {
+        "fixed": FixedCurriculum,
+        "linear": LinearCurriculum,
+        "adaptive": AdaptiveCurriculum,
+        "multitask": MultiTaskCurriculum,
+        "uniform": UniformCurriculum,
+    }
+
+    for name, config_cls in curriculum_configs.items():
+
+        print(f"\n{ANSI.bold(ANSI.blue(name))}")
+        print("-" * len(name))
+
+        # Use dataclasses.fields() to inspect the class
+        fields = dataclasses.fields(config_cls)
+
+        for field in fields:
+            field_name = field.name
+            type_str = field.type.__name__ if hasattr(field.type, '__name__') else str(field.type)
+
+            # Check if field has a default value
+            if field.default != dataclasses.MISSING:
+                default = field.default
+                req_marker = " "
+            elif field.default_factory != dataclasses.MISSING:
+                default = f"<factory: {field.default_factory.__name__}>"
+                req_marker = " "
+            else:
+                default = "REQUIRED"
+                req_marker = ANSI.red("*")
+
+            print(f"{req_marker} {ANSI.green(field_name)} ({type_str}): default={default}")
+
+    print("\n" + "="*60)
+    print(f"Usage: uv run inmaton --curriculum_type <name> --curriculum_kwargs '{{\"key\": \"value\"}}'")

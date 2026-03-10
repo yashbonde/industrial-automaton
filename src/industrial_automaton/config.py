@@ -1,4 +1,5 @@
 import sys
+import random
 import logging
 import randomname
 from typing import Optional
@@ -31,26 +32,35 @@ class Settings(BaseSettings):
 
     # General configuration
     log_level: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
-    seed: int = Field(default=4, description="Random seed for reproducibility")
 
-    # Task/Generation limits
+    # Task/Generation/Dataset configs
     task: str = Field(
-        default="reverse_string", 
-        description=(
-            "Task to perform. Available tasks categorized by complexity:\n"
-            "  - REGULAR: parity_check, even_pairs, modular_arithmetic, cycle_navigation\n"
-            "  - CONTEXT-FREE: dyck_n, reverse_string, stack_manipulation, solve_equation, nested_modular_arithmetic\n"
-            "  - CONTEXT-SENSITIVE: binary_addition, binary_multiplication, square_root, repeat_copy_n, duplicate_string, count_n, associative_recall, odds_first\n"
-            "  - ALGORITHMIC: sort, python_execution, graph_traversal, shortest_path, tsp, mst_prim"
-        )
+        default="reverse_string",
+        description=("Run `uv run inmaton-tasks` to see the list of available tasks.")
     )
-    n: Optional[int] = Field(default=None, description="Task parameter 'n' (e.g. number of bracket types for dyck_n, number of symbol types for count_n)")
-    tr_max_seqlen: int = Field(default=40, description="Max sequence length for training")
-    tr_task_kwargs: Optional[dict] = Field(default=None, description="Task-specific kwargs")
-    tr_eval_max_seqlen: int = Field(default=100, description="Max sequence length for evaluation")
-    tr_eval_task_kwargs: Optional[dict] = Field(default=None, description="Task-specific kwargs")
+    tasks: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of tasks for multi-task training (e.g. 'associative_recall,reverse_string'). Overrides --task when set."
+    )
+    max_seqlen: int = Field(default=40, description="Max sequence length for training")
+    eval_max_seqlen: int = Field(default=100, description="Max sequence length for evaluation")
+    task_kwargs: Optional[dict] = Field(default=None, description="Task-specific kwargs")
+    eval_task_kwargs: Optional[dict] = Field(default=None, description="Task-specific kwargs")
+    dataset_size: int = Field(default=10_000, description="Size of the training dataset.")
+    eval_dataset_size: int = Field(default=1_000, description="Size of the evaluation dataset.")
 
-    # Model
+    # Curriculum learning settings
+    curriculum_type: Optional[str] = Field(
+        default=None,
+        description="Curriculum strategy: 'fixed', 'linear', 'adaptive', 'multitask', 'uniform' (default: None = no curriculum). 'uniform' matches Delétang et al. 2023: random length each step, on-the-fly batch generation."
+    )
+    curriculum_kwargs: Optional[dict] = Field(
+        default=None,
+        description="Curriculum hyperparameters (e.g., {'advance_threshold': 0.9, 'ema_decay': 0.95})"
+    )
+
+
+    # Model config
     model: str = Field(
         default="baby_ntm", 
         description=(
@@ -64,78 +74,42 @@ class Settings(BaseSettings):
     )
     model_kwargs: dict = Field(
         default_factory=dict,
-        description = "Additional model kwargs. Run uv run inmaton-models to see the required kwargs for each model."
+        description = "Additional model kwargs. Run `$ uv run inmaton-models` to see the required kwargs for each model."
     )
+    embedding_dim: int = Field(default=16, description="Embedding dimension for the model. This becomes the common embedding dimension for all models.")
+    embedding_type: str = Field(default='binary', description="Embedding type. Choices: 'binary', 'cosine', 'learnable', 'one_hot'. If 'one_hot', ignores embedding_dim.")
+    hard_array_limit: int = Field(default=1024, description="Max Token Array size. This helps with autoregressive generation.")
 
     # Exhaustive Trainer args
-    tr_run_name: Optional[str] = Field(default=None, description="Experiment name. Outputs saved in {save_folder}/{run_name}")
-    tr_eval_steps: int = Field(default=100, description="Evaluation frequency (run eval every N steps).")
-    tr_seed: Optional[int] = Field(default=None, description="Random seed for weight initialization and data shuffling.")
-    tr_save_folder: str = Field(default="assets/training_runs", description="Root folder for saving logs and checkpoints.")
-    tr_save_steps: int = Field(default=1000, description="Checkpoint save frequency.")
-    tr_save_limit: int = Field(default=5, description="Max checkpoints to retain excluing best model.")
-    tr_num_train_epochs: int = Field(default=1, description="Number of training epochs (1 is usually enough for synthetic tasks).")
-    tr_max_steps: int = Field(default=10_000, description="Total training iterations.")
-    tr_lr: float = Field(default=1e-3, description="Initial learning rate.")
-    tr_lr_scheduler: Optional[str] = Field(default=None, description="LR schedule: 'constant', 'cosine', or 'linear'.")
-    tr_lr_scheduler_kwargs: Optional[dict] = Field(default=None, description="Optional scheduler arguments (e.g. {'end_value': 1e-5})")
-    tr_warmup_steps: int = Field(default=0, description="Linear warmup steps.")
-    tr_optimizer: str = Field(default="adamw", description="Optimizer choice: 'adam', 'adamw', or 'sgd'.")
-    tr_optimizer_kwargs: Optional[dict] = Field(default=None, description="Optional optimizer arguments (e.g. {'weight_decay': 0.01})")
-    tr_gradient_accumulation_steps: int = Field(default=1, description="Steps to accumulate before an update (effectively batch_size multiplier).")
-    tr_max_grad_norm: float = Field(default=1.0, description="Threshold for gradient clipping.")
-    tr_precision: str = Field(default="mixed-bf16-fp32", description="Compute precision: 'fp32', 'bf16', or 'mixed-bf16-fp32'.")
-    tr_logging_steps: int = Field(default=10, description="Logging frequency.")
-    tr_tensorboard: bool = Field(default=False, description="Enable TensorBoard logging.")
-    tr_tensorboard_log_dir: Optional[str] = Field(default=None, description="Required when logging using tensorboard. Path to the TensorBoard log directory.")
+    save_folder: str = Field(default="assets/training_runs", description="Root folder for saving logs and checkpoints.")
+    run_name: Optional[str] = Field(default=None, description="Experiment name. Outputs are saved in {save_folder}/{run_name}")
+    timeout: Optional[int]  = Field(default=None, description="Timeout in seconds for each run.")
+    seed: Optional[int] = Field(default=None, description="Random seed for weight initialization and data shuffling.")
+    eval_steps: int = Field(default=100, description="Evaluation frequency (run eval every N steps).")
+    early_stopping_patience: int = Field(default=20, description="Number of eval rounds with no improvement before stopping.")
+    save_limit: int = Field(default=5, description="Max checkpoints to retain excluing best model.")
+    max_steps: int = Field(default=10_000, description="Total training iterations.")
+    learning_rate: float = Field(default=3e-4, description="Initial learning rate.")
+    optimizer: str = Field(default="adamw", description="Optimizer choice: 'adam', 'adamw', or 'sgd'.")
+    optimizer_kwargs: Optional[dict] = Field(default=None, description="Optional optimizer arguments (e.g. {'weight_decay': 0.01})")
+    batch_size: Optional[int] = Field(default=64, description="Batch size.")
+    eval_batch_size: Optional[int] = Field(default=-1, description="By default (-1) send all items in one go.")
+    precision: str = Field(default="mixed-bf16-fp32", description="Compute precision: 'fp32', 'bf16', or 'mixed-bf16-fp32'.")
 
     @model_validator(mode='after')
     def set_correct_default(self) -> "Settings":
-        if self.tr_run_name is None:
-            self.tr_run_name = randomname.get_name()
+        if self.run_name is None:
+            self.run_name = randomname.get_name()
         if self.seed is None:
             self.seed = random.randint(0, 1000)
+        print(f"Run name: {ANSI.bold(self.run_name)}")
+        print(f"Using seed: {ANSI.bold(self.seed)}")
+        print(f"Hard array limit: {ANSI.bold(str(self.hard_array_limit))}")
         return self
 
-    @model_validator(mode='after')
-    def validate_task_and_seqlen(self) -> "Settings":
-        # We handle task naming flexibility
-        if not self.task.startswith("generate_"):
-            task_key = f"generate_{self.task}"
-        else:
-            task_key = self.task
-
-        _MAX_LENGTHS = {
-            "generate_binary_addition": 64,
-            "generate_binary_multiplication": 32,
-            "generate_square_root": 19,
-            "generate_repeat_copy_n": 1000,
-            "generate_duplicate_string": 3333,
-            "generate_deduplicate_inputs": 3333,
-            "generate_missing_duplicate": 5000,
-            "generate_odds_first": 5000,
-            "generate_associative_recall": 18,
-            "generate_n_back": 4999,
-            "generate_python_execution": 999,
-            "generate_sort": 5000,
-            "generate_stack_manipulation": 5000,
-            "generate_reverse_string": 5000,
-            "generate_dyck_n": 5000,
-            "generate_parity": 5000,
-        }
-        
-        limit = _MAX_LENGTHS.get(task_key, 1000)
-        if self.tr_max_seqlen > limit:
-            print(f"Setting maxlen for {ANSI.bold(task_key)} to {ANSI.bold(limit)} (was {self.tr_max_seqlen}).")
-            self.tr_max_seqlen = limit
-        return self
-
-# Create global settings instance
-settings = Settings()
-
-def get_logger(name: str = "industrial_automaton") -> logging.Logger:
+def get_logger(name: str = "industrial_automaton", log_level: str = "INFO") -> logging.Logger:
     """Returns a logger object"""
-    lvl = settings.log_level.upper()
+    lvl = log_level.upper()
     logger = logging.getLogger(name)
     # Clear handlers if they already exist
     if logger.hasHandlers():
@@ -150,5 +124,3 @@ def get_logger(name: str = "industrial_automaton") -> logging.Logger:
     )
     logger.addHandler(log_handler)
     return logger
-
-logger = get_logger()
