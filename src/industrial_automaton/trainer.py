@@ -89,7 +89,7 @@ class DivergenceMonitor:
             self.loss_ema = self.ema_decay * self.loss_ema + (1 - self.ema_decay) * loss
 
             # Check if loss has plateaued
-            if abs(self.loss_ema - old_ema) < self.plateau_threshold:
+            if abs(self.loss_ema - old_ema) < self.plateau_threshold and self.loss_ema > 1e-4:
                 self.plateau_count += 1
                 if self.plateau_count > self.plateau_patience:
                     raise TrainingDivergedError(
@@ -703,6 +703,7 @@ def eval_fn(model, eval_dataset_size, eval_inputs, eval_labels, eval_loss_mask=N
         b_mask = eval_loss_mask[start:end]
 
         l, metrics = eval_batch(model, b_in, b_tgt, b_mask)
+
         total_loss += float(l) * (end - start)
         total_token_acc += float(metrics["token_accuracy"]) * (end - start)
         total_seq_acc += float(metrics["sequence_accuracy"]) * (end - start)
