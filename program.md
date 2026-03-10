@@ -78,10 +78,10 @@ uv run inmaton \
     --seed 4 \
     --log_level WARNING \
     --timeout 600 \  // 10-min timeout
-    > run.log 2>&1
+    > logs/run.log 2>&1
 ```
 
-Redirect everything `> run.log 2>&1` - do NOT use tee or let output flood your context.
+Redirect everything `> logs/run.log 2>&1` - do NOT use tee or let output flood your context.
 
 For curriculum training, add:
 
@@ -92,22 +92,19 @@ For curriculum training, add:
 
 ## Goals and metric
 
-**The goal: maximise `seq_acc`** (sequence accuracy — the entire output sequence must be
-correct). `tok_acc` (token accuracy) is secondary and reported for context. **Do not**
-change the loss function or evaluation harness.
+**The goal**: Train the smallest model to maximise `seq_acc`** (sequence accuracy — the
+entire output sequence must be correct) for multiple tasks. `tok_acc` (token accuracy)
+is secondary and reported for context. Everything is fair game: change the architecture,
+the optimizer, the hyperparameters, the batch size, the model size. The only constraint
+is that the code runs without crashing and finishes within the time budget.
+
+**Do not** change the loss function or evaluation harness.
 
 **Model**: Always `tape_rnn`. The only model being iterated on is TapeRNN and variants
 of it defined in `tape.py`. Do not switch to baby_ntm, lstm, or any other model.
 
-**Task progression:**
-- **Phase 1**: Optimise a single target task. Start with `associative_recall` (hardest
-  reliably solved task, best baseline: tape_rnn seq_acc=0.89 at h=128, m=16, cell=8, L=8).
-- **Phase 2**: Once Phase 1 task is consistently ≥ 0.95 across both seeds, add a second
-  task. Run on both tasks and measure average seq_acc.
-- **Phase 3**: Multi-task training
-
-**Model size cap**: Keep total parameter count below **1 000 000 params** (1M). The model
-param count is printed at startup as `Model params: X.XXX K`. Exceeding 1M is a soft
+**Model size cap**: Keep total parameter count below **500 000 params** (500K). The model
+param count is printed at startup as `Model params: X.XXX K`. Exceeding 500K is a soft
 constraint — flag it in the description but don't automatically discard.
 
 **Simplicity criterion**: All else being equal, simpler is better. A tiny improvement
@@ -119,30 +116,15 @@ the best known config from `EXPERIMENTS.md` without any changes.
 
 **OOD Generalisation**: All models when evaled on their training size work well, we want
 models that can generalise to much longer sequence lengths, that is the real test. Keep
-eval max seqlen atleast 20x longer than training.
-
-## Seed policy
-
-Results only count if they hold across **two seeds**.
-
-- Perform first run. If it fails badly, discard immediately.
-- If it looks promising (seq_acc ≥ 0.50), run seed=4 to confirm.
-- A result is **consistent** if both seeds achieve seq_acc ≥ 0.50.
-- A result is **flaky** if only one seed achieves ≥ 0.50 — note it but do not count it
-  as a solved task.
-- When logging to results.tsv, log the **lower** of the two seed results as seq_acc
-  (conservative estimate). Add both individual values in the description.
-
-`reverse_string` and `associative_recall` are the two reliably solved TapeRNN tasks.
-`deduplicate_inputs` and `duplicate_string` are seed-sensitive and not reliably solved.
-Print all the tasks using `uv run inmaton-tasks` for all the tasks.
+eval max seqlen atleast 20x longer than training. Minimum train length is 20 and max eval
+length is 400.
 
 ## Output format
 
 `inmaton` prints training progress and a final summary. Extract results with:
 
 ```bash
-grep "^Final\|Model params\|Eval @" run.log | tail -5
+grep "^Final\|Model params\|Eval @" logs/run.log | tail -5
 ```
 
 The final lines look like:
@@ -160,7 +142,7 @@ Final sequence accuracy: 0.8910
 Extract the key metrics:
 
 ```bash
-grep -E "^Final (token|sequence)|Model params" run.log
+grep -E "^Final (token|sequence)|Model params" logs/run.log
 ```
 
 Wall time is measured externally with `time ...`.
@@ -208,13 +190,13 @@ The experiment runs on the dedicated autoresearch branch.
 3. Form a hypothesis — what change might improve seq_acc and why?
 4. Make the change: edit model files, config.py, or the CLI args.
 5. `git commit -m "brief description of change"`
-6. `time uv run inmaton [args] > run.log 2>&1`
+6. `time uv run inmaton [args] > logs/run.log 2>&1`
 7. If run exceeds **15 minutes**, kill it: `kill %1` — treat as crash, skip seed=4.
-8. Parse results: `grep -E "^Final (token|sequence)|Model params" run.log`
-9. If grep is empty → crash. Run `tail -50 run.log` for the traceback.
+8. Parse results: `grep -E "^Final (token|sequence)|Model params" logs/run.log`
+9. If grep is empty → crash. Run `tail -50 logs/run.log` for the traceback.
    - Simple fix (typo, missing import)? Fix and re-run.
    - Fundamentally broken? Log as crash, `git reset --hard HEAD~1`, move on.
-10. If seq_acc ≥ 0.50 then run again with `seed=4`: `time uv run inmaton [args] --seed 4 > run_4.log 2>&1`
+10. If seq_acc ≥ 0.8 then run again with `seed=4`: `time uv run inmaton [args] --seed 4 > run_4.log 2>&1`
 11. Record both results in `results.tsv` using the **lower** seq_acc.
 12. **If seq_acc improved over previous best** (both seeds ≥ prev best):
     - Status = `keep`. Advance — stay on this commit.
@@ -222,19 +204,13 @@ The experiment runs on the dedicated autoresearch branch.
     - Status = `discard`. `git reset --hard HEAD~1`.
 14. Repeat.
 
+The idea is that you are a completely autonomous researcher trying things out. If they
+work, keep. If they don't, discard. And you're advancing the branch so that you can
+iterate. If you feel like you're getting stuck in some way, you can rewind but you should
+probably do this very very sparingly (if ever).
+
 **Crashes**: Fix obvious bugs and retry once. If the idea is fundamentally broken, log
 `crash`, reset, move on.
-
-**Stuck?** Re-read `EXPERIMENTS.md` and `src/industrial_automaton/models/tape.py`. Ideas
-to try within TapeRNN:
-- Different controller (VanillaRNN → LSTM → GRU)
-- Different head design (how read/write weights are computed)
-- Different memory cell size or number of memory slots
-- Different initialization (weight init, tape init)
-- Additional tape ops or modified movement logic
-- Curriculum learning (adaptive L=3→max) for tasks where tok_acc >> seq_acc
-- Lower learning rate or different optimizer (adam → adamw → sgd)
-- Combining near-miss configs from `EXPERIMENTS.md`
 
 **NEVER STOP**: Once the loop has begun, do NOT pause to ask the human whether to
 continue. The human may be away. Run autonomously until manually interrupted. If you
@@ -248,4 +224,3 @@ As an example use case, a user might leave you running while they sleep. If each
 takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the
 duration of the average human sleep. The user then wakes up to experimental results, all
 completed by you while they slept!
-
