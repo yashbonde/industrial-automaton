@@ -185,9 +185,10 @@ class ModelPipeline(eqx.Module):
         # 1. Create PAD mask (model-agnostic detection)
         pad_mask = (x != PAD)  # (T,) [True, True, True, False, False, True, False]
 
-        # 2. Compute input_length = number of tokens before SEP
+        # 2. Compute input_length = number of tokens before SEP or YIELD
         #    Used by TapeRNN for correct jump distance
-        sep_positions = jnp.where(x == SEP, jnp.arange(x.shape[0]), x.shape[0])
+        from industrial_automaton.vocab import YIELD
+        sep_positions = jnp.where((x == SEP) | (x == YIELD), jnp.arange(x.shape[0]), x.shape[0])
         input_length = jnp.min(sep_positions)
 
         # 3. Embed tokens

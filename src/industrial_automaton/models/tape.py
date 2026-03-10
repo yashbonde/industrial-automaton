@@ -9,7 +9,7 @@ Shared utilities:
 - apply_memory_ops(): Weighted combination of memory operations
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Any
 from pydantic import BaseModel
 
 import jax
@@ -85,7 +85,7 @@ class VanillaRNNCell(eqx.Module):
 
 class TapeRNNState(NamedTuple):
     memory: jnp.ndarray   # (MemorySize, memory_cell_size)
-    hidden: jnp.ndarray   # (hidden_size,)
+    hidden: Any           # (hidden_size,) array or tuple of arrays for LSTM
 
 class TapeRNNConfig(BaseModel):
     embedding_dim: int = 32
@@ -93,23 +93,26 @@ class TapeRNNConfig(BaseModel):
     memory_size: int = 40           # Number of tape cells
     memory_cell_size: int = 8       # Dimension of each tape cell
     use_gru: bool = False           # Use GRU instead of VanillaRNN
+    use_lstm: bool = False          # Use LSTM instead of VanillaRNN
 
 class TapeRNN(BaseAutomata):
-    """Tape-RNN matching Delétang et al. (2023):
-    - VanillaRNN controller (not LSTM) - GRU optional
-    - Memory read concatenated to input (not injected into hidden)
+    """Tape-RNN matching Delétang et al. (2023) with enhancements:
+    - Flexible controller (VanillaRNN, GRU, or LSTM)
+    - Windowed read head (3 cells) for broader local context
     - MLP write head
+    - Learnable tape initialization
+    - Initial action bias favoring Right movement
     - 5 tape actions: Stay, Left, Right, JumpLeft(L), JumpRight(L)
     - hidden_size decoupled from embedding_dim
     """
-    autoregressive_input: bool = eqx.field(default=True, static=True)
-
-    rnn: eqx.Module                 # eqx.nn.GRUCell or VanillaRNNCell
-    W_m: jnp.ndarray               # (hidden_size, memory_cell_size) — memory read projection
+    rnn: eqx.Module                 # eqx.nn.GRUCell, eqx.nn.LSTMCell, or VanillaRNNCell
+    W_m: jnp.ndarray               # (hidden_size, memory_cell_size * 3) — windowed memory read projection
     W_a: jnp.ndarray               # (5, hidden_size) — action logits
+    b_a: jnp.ndarray               # (5,) — action bias
     write_l1: eqx.nn.Linear        # hidden_size -> 64
     write_l2: eqx.nn.Linear        # 64 -> 64
     write_l3: eqx.nn.Linear        # 64 -> memory_cell_size
+    tape_init: jnp.ndarray         # (memory_size, memory_cell_size)
 
     vocab_size: int = eqx.field(static=True)
     embedding_dim: int = eqx.field(static=True)
@@ -117,65 +120,89 @@ class TapeRNN(BaseAutomata):
     memory_size: int = eqx.field(static=True)
     memory_cell_size: int = eqx.field(static=True)
     use_gru: bool = eqx.field(static=True)
+    use_lstm: bool = eqx.field(static=True)
 
     def __init__(self, config: TapeRNNConfig, *, key):
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
         self.vocab_size = VOCAB_SIZE
         self.embedding_dim = config.embedding_dim
         self.hidden_size = config.hidden_size
         self.memory_size = config.memory_size
         self.memory_cell_size = config.memory_cell_size
         self.use_gru = config.use_gru
+        self.use_lstm = config.use_lstm
 
-        # RNN input = embedding + memory read projection (both hidden_size dim)
+        # RNN input = embedding + memory read projection
         rnn_input_size = config.embedding_dim + config.hidden_size
-        if self.use_gru:
+        if self.use_lstm:
+            self.rnn = eqx.nn.LSTMCell(rnn_input_size, config.hidden_size, key=k1)
+        elif self.use_gru:
             self.rnn = eqx.nn.GRUCell(rnn_input_size, config.hidden_size, key=k1)
         else:
             self.rnn = VanillaRNNCell(rnn_input_size, config.hidden_size, key=k1)
 
         scale = 0.1
-        self.W_m = jax.random.normal(k2, (config.hidden_size, config.memory_cell_size)) * scale
+        # Windowed read: read current cell and its immediate neighbors
+        self.W_m = jax.random.normal(k2, (config.hidden_size, config.memory_cell_size * 3)) * scale
         self.W_a = jax.random.normal(k3, (5, config.hidden_size)) * scale
+        # Initial action bias: strongly favor Right movement (index 2)
+        self.b_a = jnp.array([0.0, 0.0, 3.0, 0.0, 0.0])
+        
         # MLP: hidden_size -> 64 -> 64 -> memory_cell_size (matching paper)
         k4a, k4b, k4c = jax.random.split(k4, 3)
         self.write_l1 = eqx.nn.Linear(config.hidden_size, 64, key=k4a)
         self.write_l2 = eqx.nn.Linear(64, 64, key=k4b)
         self.write_l3 = eqx.nn.Linear(64, config.memory_cell_size, key=k4c)
+        
+        # Learnable tape initialization
+        self.tape_init = jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
 
     @property
     def output_dim(self) -> int:
         return self.hidden_size
 
     def init_state(self) -> TapeRNNState:
+        dtype = self.tape_init.dtype
+        if self.use_lstm:
+            hidden = (jnp.zeros(self.hidden_size, dtype=dtype), jnp.zeros(self.hidden_size, dtype=dtype))
+        else:
+            hidden = jnp.zeros(self.hidden_size, dtype=dtype)
         return TapeRNNState(
-            memory=jnp.zeros((self.memory_size, self.memory_cell_size)),
-            hidden=jnp.zeros(self.hidden_size),
+            memory=self.tape_init,
+            hidden=hidden,
         )
 
     def step(self, x_t: jnp.ndarray, state: TapeRNNState, jump_len: int, is_valid):
         """Single timestep. x_t: (embedding_dim,). Returns (hidden_t, new_state)."""
         memory, hidden = state
+        
+        # h_t is the actual hidden state vector used for attention/output
+        h_t = hidden[0] if self.use_lstm else hidden
 
-        # 1. Read current tape cell and project to hidden_size
-        mem_read = self.W_m @ memory[0]   # (hidden_size,)
+        # 1. Windowed Read: current tape cell and immediate neighbors
+        # memory is (N, cell_size). We read cell -1, 0, 1 relative to head.
+        # Since memory is shifted, head is always at index 0.
+        window = jnp.concatenate([memory[-1], memory[0], memory[1]])
+        mem_read = self.W_m @ window   # (hidden_size,)
 
         # 2. Concatenate embedding + memory read, then step RNN
         rnn_input = jnp.concatenate([x_t, mem_read])  # (embedding_dim + hidden_size,)
-        hidden_new = self.rnn(rnn_input, hidden)       # (hidden_size,)
+        hidden_new = self.rnn(rnn_input, hidden)       # (hidden_size,) or tuple
+
+        h_new_t = hidden_new[0] if self.use_lstm else hidden_new
 
         # 3. Action weights over 5 tape ops
-        a_t = jax.nn.softmax(self.W_a @ hidden_new)
+        a_t = jax.nn.softmax(self.W_a @ h_new_t + self.b_a)
 
         # 4. Write value via MLP
-        n_t = jax.nn.relu(self.write_l1(hidden_new))
+        n_t = jax.nn.relu(self.write_l1(h_new_t))
         n_t = jax.nn.relu(self.write_l2(n_t))
         n_t = self.write_l3(n_t)  # (memory_cell_size,)
 
         # 5. Write to tape cell 0, then apply weighted shift
         memory_w = memory.at[0].set(n_t)
 
-        eye = jnp.eye(self.memory_size)
+        eye = jnp.eye(self.memory_size, dtype=memory.dtype)
         ops = jnp.stack([
             eye,                                          # Stay
             jnp.roll(eye, shift=1, axis=0),              # Left
@@ -185,11 +212,20 @@ class TapeRNN(BaseAutomata):
         ])
         memory_new = jnp.einsum('i,isj,jk->sk', a_t, ops, memory_w)
 
+        # Handle freezing correctly for tuples
+        if self.use_lstm:
+            hidden_frozen = (
+                jnp.where(is_valid, hidden_new[0], hidden[0]),
+                jnp.where(is_valid, hidden_new[1], hidden[1])
+            )
+        else:
+            hidden_frozen = jnp.where(is_valid, hidden_new, hidden)
+
         frozen_state = TapeRNNState(
             memory=jnp.where(is_valid, memory_new, memory),
-            hidden=jnp.where(is_valid, hidden_new, hidden),
+            hidden=hidden_frozen,
         )
-        return hidden_new, frozen_state
+        return h_new_t, frozen_state
 
     def __call__(self, inputs: jnp.ndarray, state: TapeRNNState, pad_mask, input_length=None):
         """Process sequence. inputs: (T, embedding_dim). Returns (hidden_states (T, hidden_size), final_state)."""
