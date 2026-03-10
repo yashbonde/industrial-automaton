@@ -185,7 +185,7 @@ class AdaptiveCurriculum:
             smoothed = self.ema_decay * state.smoothed_accuracy + (1 - self.ema_decay) * accuracy
 
         # Check for advancement
-        if smoothed > self.advance_threshold:
+        if smoothed >= self.advance_threshold:
             new_streak = state.consecutive_successes + 1
         else:
             new_streak = 0
@@ -196,14 +196,13 @@ class AdaptiveCurriculum:
         if new_streak >= self.advance_streak:
             new_bound = min(state.max_bound, state.current_bound + self.step_size)
             new_streak = 0  # Reset
+            smoothed = 0.0 # Reset EMA on advance
 
         # CRITICAL: Backoff if diverging at max length
         if loss > self.backoff_threshold and state.current_bound == state.max_bound:
             new_bound = max(state.min_bound, state.current_bound - self.step_size)
             new_streak = 0
 
-        # Create new state with updated values
-        # We need to handle None values explicitly for equinox
         return CurriculumState(
             step=state.step + 1,
             current_bound=new_bound,

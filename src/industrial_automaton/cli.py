@@ -142,6 +142,10 @@ def cli():
             eval_dataset_size=settings.eval_dataset_size,
         )
 
+        if settings.load_ckpt:
+            print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
+            trainer.load(settings.load_ckpt)
+
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:
             history = trainer.fit(data_generator=combined_iter)
@@ -383,6 +387,10 @@ def cli():
         eval_loss_mask=eval_loss_mask,
         eval_dataset_size=settings.eval_dataset_size,
     )
+
+    if settings.load_ckpt:
+        print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
+        trainer.load(settings.load_ckpt)
 
     # Inject pre-built curriculum state for curricula that need it
     if use_online and curriculum_state is not None:

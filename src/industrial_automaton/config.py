@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # Exhaustive Trainer args
     save_folder: str = Field(default="assets/training_runs", description="Root folder for saving logs and checkpoints.")
     run_name: Optional[str] = Field(default=None, description="Experiment name. Outputs are saved in {save_folder}/{run_name}")
+    load_ckpt: Optional[str] = Field(default=None, description="Path to a checkpoint (.eqx) to load before training/eval.")
     timeout: Optional[int]  = Field(default=None, description="Timeout in seconds for each run.")
     seed: Optional[int] = Field(default=None, description="Random seed for weight initialization and data shuffling.")
     eval_steps: int = Field(default=100, description="Evaluation frequency (run eval every N steps).")

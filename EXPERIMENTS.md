@@ -666,4 +666,33 @@ uv run python assets/grid_search/grid_search_curriculum.py
 # see results table for individual commands
 ```
 
-All results are saved to the corresponding `assets/grid_search/grid_search_*_results.csv` files.
+---
+
+## Experiment 9 — OOD Generalisation Testing
+
+**Goal:** Test how well models trained on `L=8` generalise to longer sequences (2x, 4x, 20x).
+
+### Method
+- Best models from Exp 8 were loaded from checkpoints.
+- Evaluation run on `eval_dataset_size=1000` with varying `eval_max_seqlen`.
+- For tasks exceeding original `memory_size`, memory was either kept fixed (testing wrap-around) or expanded (testing structural invariance).
+
+### Results (original memory size)
+
+| Task | L=8 (Train) | L=16 (2x) | L=32 (4x) | L=160 (20x) |
+|---|---|---|---|---|
+| reverse_string | **1.000** | 0.753 | 0.254 | 0.000 |
+| associative_recall | **0.965** | 0.483 | 0.341 | 0.000 |
+| sort | **0.921** | 0.242 | 0.043 | 0.000 |
+| odds_first | **0.929** | 0.461 | — | 0.000 |
+| deduplicate_inputs | **0.875** | 0.323 | — | 0.000 |
+| repeat_copy_n | **0.761** | 0.000 | — | 0.000 |
+
+### Observations
+1.  **Partial Generalisation**: Models show decent generalisation to 2x lengths, especially for `reverse_string` and `associative_recall`.
+2.  **Memory Bottleneck**: Generalisation drops sharply once sequence length exceeds `memory_size`. Wrap-around behavior allows some success but is not reliable.
+3.  **Zero generalisation to 20x**: Current architectures/training strategies fail completely at extreme OOD scales.
+
+---
+
+## Experiment 10 — Length Curriculum for OOD (In Progress)

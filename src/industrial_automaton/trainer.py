@@ -432,7 +432,7 @@ class Trainer:
             # Apply
             self.state = self._jit_apply_grads(self.state, avg_grads)
 
-            accuracy = avg_aux.get("accuracy")
+            accuracy = avg_aux.get("sequence_accuracy")
             acc_val = jnp.array(accuracy) if accuracy is not None else None
             metrics = StepMetrics(loss=jnp.array(avg_loss), accuracy=acc_val, aux=avg_aux or None)
             history.append(metrics)
