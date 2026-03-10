@@ -199,23 +199,24 @@ The experiment runs on the dedicated autoresearch branch.
 
 **LOOP FOREVER:**
 
-1. Check git state: `git log --oneline -5` and `git status`.
-2. Form a hypothesis — what change might improve seq_acc and why?
-3. Make the change: edit model files, config.py, or the CLI args.
-4. `git commit -m "brief description of change"`
-5. `time uv run inmaton [args] > run.log 2>&1`
-6. If run exceeds **15 minutes**, kill it: `kill %1` — treat as crash, skip seed=4.
-7. Parse results: `grep -E "^Final (token|sequence)|Model params" run.log`
-8. If grep is empty → crash. Run `tail -50 run.log` for the traceback.
+1. Read config.py to see if there are any new hyperparameters.
+2. Check git state: `git log --oneline -5` and `git status`.
+3. Form a hypothesis — what change might improve seq_acc and why?
+4. Make the change: edit model files, config.py, or the CLI args.
+5. `git commit -m "brief description of change"`
+6. `time uv run inmaton [args] > run.log 2>&1`
+7. If run exceeds **15 minutes**, kill it: `kill %1` — treat as crash, skip seed=4.
+8. Parse results: `grep -E "^Final (token|sequence)|Model params" run.log`
+9. If grep is empty → crash. Run `tail -50 run.log` for the traceback.
    - Simple fix (typo, missing import)? Fix and re-run.
    - Fundamentally broken? Log as crash, `git reset --hard HEAD~1`, move on.
-9. If seq_acc ≥ 0.50 then run again with `seed=4`: `time uv run inmaton [args] --seed 4 > run_4.log 2>&1`
-10. Record both results in `results.tsv` using the **lower** seq_acc.
-11. **If seq_acc improved over previous best** (both seeds ≥ prev best):
+10. If seq_acc ≥ 0.50 then run again with `seed=4`: `time uv run inmaton [args] --seed 4 > run_4.log 2>&1`
+11. Record both results in `results.tsv` using the **lower** seq_acc.
+12. **If seq_acc improved over previous best** (both seeds ≥ prev best):
     - Status = `keep`. Advance — stay on this commit.
-12. **If seq_acc did not improve**:
+13. **If seq_acc did not improve**:
     - Status = `discard`. `git reset --hard HEAD~1`.
-13. Repeat.
+14. Repeat.
 
 **Crashes**: Fix obvious bugs and retry once. If the idea is fundamentally broken, log
 `crash`, reset, move on.

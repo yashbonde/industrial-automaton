@@ -702,7 +702,7 @@ def eval_fn(model, eval_dataset_size, eval_inputs, eval_labels, eval_loss_mask=N
         b_tgt = eval_labels[start:end]
         b_mask = eval_loss_mask[start:end]
 
-        l, metrics = eval_batch(m, b_in, b_tgt, b_mask)
+        l, metrics = eval_batch(model, b_in, b_tgt, b_mask)
         total_loss += float(l) * (end - start)
         total_token_acc += float(metrics["token_accuracy"]) * (end - start)
         total_seq_acc += float(metrics["sequence_accuracy"]) * (end - start)
