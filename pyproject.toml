@@ -17,12 +17,14 @@ dependencies = [
     "pydantic-settings>=2.13.1",
     "tensorboardX>=2.6",
     "randomname>=0.2.1",
+    "textual>=1.0.0",
 ]
 
 [project.scripts]
 inmaton = "industrial_automaton.cli:cli"
 inmaton-tasks = "industrial_automaton.cli:print_task_configs"
 inmaton-models = "industrial_automaton.cli:print_model_configs"
+inmaton-classroom = "industrial_automaton.cli:print_curriculum_configs"
 
 [build-system]
 requires = ["hatchling"]
@@ -31,10 +33,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/industrial_automaton"]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "pillow>=12.1.1",
     "pymupdf>=1.27.1",
     "requests>=2.32.5",
     "pytest>=8.3.4",
+    "pandas>=2.0.0",
+    "tabulate>=0.9.0",
 ]
