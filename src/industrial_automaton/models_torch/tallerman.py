@@ -106,7 +106,7 @@ class Tallerman(BaseAutomata):
         self.content_read_gate = nn.Linear(config.hidden_size, 1)
         with torch.no_grad():
             nn.init.normal_(self.content_read_gate.weight, std=scale, generator=generator)
-            self.content_read_gate.bias.fill_(3.0)  # start gate near open (sigmoid(3)≈0.95)
+            nn.init.zeros_(self.content_read_gate.bias)
 
         # Action logits
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
