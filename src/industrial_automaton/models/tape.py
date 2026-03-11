@@ -233,15 +233,14 @@ class TapeRNN(BaseAutomata):
             m_h = memory[h]
             memory_w = m_h.at[0].set(n_t)
 
-            eye = jnp.eye(self.memory_size, dtype=memory.dtype)
-            ops = jnp.stack([
-                eye,                                          # Stay
-                jnp.roll(eye, shift=1, axis=0),              # Left
-                jnp.roll(eye, shift=-1, axis=0),             # Right
-                jnp.roll(eye, shift=jump_len, axis=0),       # JumpLeft(L)
-                jnp.roll(eye, shift=-jump_len, axis=0),      # JumpRight(L)
-            ])
-            m_h_new = jnp.einsum('i,isj,jk->sk', a_t[h], ops, memory_w)
+            # Optimized shift using jnp.roll directly
+            m_h_new = (
+                a_t[h, 0] * memory_w +
+                a_t[h, 1] * jnp.roll(memory_w, shift=1, axis=0) +
+                a_t[h, 2] * jnp.roll(memory_w, shift=-1, axis=0) +
+                a_t[h, 3] * jnp.roll(memory_w, shift=jump_len, axis=0) +
+                a_t[h, 4] * jnp.roll(memory_w, shift=-jump_len, axis=0)
+            )
             memory_new_list.append(m_h_new)
 
         memory_new = jnp.stack(memory_new_list)
