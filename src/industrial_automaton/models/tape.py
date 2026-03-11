@@ -94,7 +94,7 @@ class TapeRNNConfig(BaseModel):
     hidden_size: int = 256          # RNN hidden size (independent of embedding_dim)
     memory_size: int = 40           # Number of tape cells
     memory_cell_size: int = 8       # Dimension of each tape cell
-    pos_dim: int = 8                # Dimension of positional encoding
+    pos_dim: int = 16               # Dimension of positional encoding
     use_gru: bool = False           # Use GRU instead of VanillaRNN
     use_lstm: bool = False          # Use LSTM instead of VanillaRNN
     num_heads: int = 1              # Number of independent tape heads
@@ -110,6 +110,7 @@ class TapeRNN(BaseAutomata):
     - 5 tape actions per head: Stay, Left, Right, JumpLeft(L), JumpRight(L)
     - hidden_size decoupled from embedding_dim
     - Fixed position tape for absolute orientation
+    - Gated write and erase heads
     """
     rnn: eqx.Module                 # eqx.nn.GRUCell, eqx.nn.LSTMCell, or VanillaRNNCell
     W_m: jnp.ndarray               # (hidden_size, num_heads * (memory_cell_size + pos_dim) * 3)
@@ -119,6 +120,7 @@ class TapeRNN(BaseAutomata):
     write_l2: eqx.nn.Linear        # 64 -> 64
     write_l3: eqx.nn.Linear        # 64 -> num_heads * memory_cell_size
     write_gate: eqx.nn.Linear      # hidden_size -> num_heads
+    erase_gate: eqx.nn.Linear      # hidden_size -> num_heads
     tape_init: jnp.ndarray         # (memory_size, memory_cell_size)
     pos_tape_init: jnp.ndarray     # (memory_size, pos_dim) - static field
 
@@ -133,7 +135,7 @@ class TapeRNN(BaseAutomata):
     num_heads: int = eqx.field(static=True)
 
     def __init__(self, config: TapeRNNConfig, *, key):
-        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
         self.vocab_size = VOCAB_SIZE
         self.embedding_dim = config.embedding_dim
         self.hidden_size = config.hidden_size
@@ -171,6 +173,7 @@ class TapeRNN(BaseAutomata):
         self.write_l2 = eqx.nn.Linear(64, 64, key=k4b)
         self.write_l3 = eqx.nn.Linear(64, config.num_heads * config.memory_cell_size, key=k4c)
         self.write_gate = eqx.nn.Linear(config.hidden_size, config.num_heads, key=k6)
+        self.erase_gate = eqx.nn.Linear(config.hidden_size, config.num_heads, key=k7)
         
         # Learnable tape initialization
         self.tape_init = jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
@@ -238,14 +241,15 @@ class TapeRNN(BaseAutomata):
         n_t_all = self.write_l3(n_t_all).reshape(self.num_heads, self.memory_cell_size)
         
         g_t = jax.nn.sigmoid(self.write_gate(h_new_t)) # (num_heads,)
+        e_t = jax.nn.sigmoid(self.erase_gate(h_new_t)) # (num_heads,)
 
         memory_new_list = []
         pos_tape_new_list = []
         for h in range(self.num_heads):
-            # Update memory tape: gated write
+            # Update memory tape: gated write and erase
             m_h = memory[h]
-            # Baby-NTM style gated write at index 0
-            m_h_w = m_h.at[0].set((1 - g_t[h]) * m_h[0] + g_t[h] * n_t_all[h])
+            # Standard gated update: M = M * (1 - erase) + gate * write
+            m_h_w = m_h.at[0].set(m_h[0] * (1 - e_t[h]) + g_t[h] * n_t_all[h])
             
             m_h_new = (
                 a_t[h, 0] * m_h_w +
