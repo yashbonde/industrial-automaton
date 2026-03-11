@@ -254,6 +254,8 @@ def cli():
     # Generate Evaluation Data
     print(f"{ANSI.blue('Generating evaluation dataset...')}")
     eval_kwargs = task_kwargs.copy()
+    if settings.task_kwargs:
+        eval_kwargs.update(settings.task_kwargs)
     if settings.eval_task_kwargs:
         eval_kwargs.update(settings.eval_task_kwargs)
 
