@@ -200,10 +200,12 @@ class Tallerman(BaseAutomata):
         
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
-        # Content-based attention read
+        # Content-based attention read (cosine similarity, scale-invariant like DNC)
         query = h_t @ self.W_q.T  # (B, memory_cell_size)  [W_q: cell x hidden → query = h @ W_q^T]
+        query_norm = F.normalize(query, dim=-1)
+        memory_norm = F.normalize(memory, dim=-1)
         # scores: (B, num_heads, memory_size)
-        scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
+        scores = torch.einsum('bc,bnmc->bnm', query_norm, memory_norm)
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
         # weighted sum of memory cells: (B, num_heads, memory_cell_size)
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
