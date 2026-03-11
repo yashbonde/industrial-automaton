@@ -102,6 +102,12 @@ class Tallerman(BaseAutomata):
             self.ln_pos_read = nn.LayerNorm(config.hidden_size)
             self._pos_scale = math.sqrt(config.pos_dim)
 
+        # Content read gate: gating signal for content attention output
+        self.content_read_gate = nn.Linear(config.hidden_size, 1)
+        with torch.no_grad():
+            nn.init.normal_(self.content_read_gate.weight, std=scale, generator=generator)
+            nn.init.zeros_(self.content_read_gate.bias)
+
         # Action logits
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
         b_a = torch.zeros(config.num_heads * 5)
@@ -216,7 +222,8 @@ class Tallerman(BaseAutomata):
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
         # weighted sum of memory cells: (B, num_heads, memory_cell_size)
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
-        content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)
+        content_read_gate = torch.sigmoid(self.content_read_gate(h_t))  # (B, 1)
+        content_read = content_read_gate * self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)
 
         # Positional attention: query pos_tape to locate target position, read memory there
         if self.use_pos_attn:
