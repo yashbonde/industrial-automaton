@@ -140,50 +140,68 @@ class Tallerman(BaseAutomata):
     def output_dim(self) -> int:
         return self.hidden_size
 
-    def init_state(self, device=None) -> TallermanState:
+    def init_state(self, batch_size=1, device=None) -> TallermanState:
         dtype = self.tape_init.dtype
         device = device or self.tape_init.device
 
         if self.use_lstm:
             hidden = (
-                torch.zeros(self.hidden_size, dtype=dtype, device=device),
-                torch.zeros(self.hidden_size, dtype=dtype, device=device),
+                torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device),
+                torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device),
             )
         else:
-            hidden = torch.zeros(self.hidden_size, dtype=dtype, device=device)
+            hidden = torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device)
 
         return TallermanState(
-            memory=self.tape_init.unsqueeze(0).expand(self.num_heads, -1, -1).clone(),
+            memory=self.tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
             hidden=hidden,
-            pos_tape=self.pos_tape_init.unsqueeze(0).expand(self.num_heads, -1, -1).clone(),
+            pos_tape=self.pos_tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
         )
 
-    def _step(self, x_t: torch.Tensor, state: TallermanState, jump_len) -> Tuple[torch.Tensor, TallermanState]:
+    def _step(self, x_t: torch.Tensor, state: TallermanState, jump_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x_t:      (B, embedding_dim)
+            state:    TallermanState with:
+                      memory:   (B, num_heads, memory_size, memory_cell_size)
+                      hidden:   (B, hidden_size) or ((B, hidden_size), (B, hidden_size))
+                      pos_tape: (B, num_heads, memory_size, pos_dim)
+            jump_len: (B,) int tensor for shifts=jl, shifts=-jl
+
+        Returns:
+            h_new_t:    (B, hidden_size)
+            hidden_new: (B, hidden_size) or tuple (LSTM state)
+            memory_new: (B, num_heads, memory_size, memory_cell_size)
+            pos_tape_new: (B, num_heads, memory_size, pos_dim)
+        """
         memory, hidden, pos_tape = state.memory, state.hidden, state.pos_tape
         h_t = hidden[0] if self.use_lstm else hidden
+        B = x_t.shape[0]
 
         # 1. Windowed read
-        windows = []
-        for h in range(self.num_heads):
-            m_h = memory[h]
-            p_h = pos_tape[h]
-            c_h = torch.cat([m_h, p_h], dim=-1)
-            # Roll for windowed read
-            w = torch.cat([torch.roll(c_h, 1, 0)[0], c_h[0], torch.roll(c_h, -1, 0)[0]], dim=0)
-            windows.append(w)
-
-        mem_read = self.ln_read(torch.tanh(self.W_m @ torch.cat(windows, dim=0)))
+        # Concatenate memory and positional tape for reading
+        combined = torch.cat([memory, pos_tape], dim=-1)  # (B, num_heads, memory_size, cell+pos)
+        
+        # Windowed read: roll current cell, previous cell, next cell for each head
+        # combined: (B, num_heads, memory_size, C)
+        prev_c = torch.roll(combined, shifts=1, dims=2)
+        next_c = torch.roll(combined, shifts=-1, dims=2)
+        
+        # Read at position 0 for each head
+        # window: (B, num_heads, 3, C) -> (B, num_heads * 3 * C)
+        window = torch.cat([prev_c[:, :, 0], combined[:, :, 0], next_c[:, :, 0]], dim=-1)
+        window = window.reshape(B, -1)
+        
+        mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
         # 2. RNN step
-        rnn_input = torch.cat([x_t, mem_read], dim=0)
+        rnn_input = torch.cat([x_t, mem_read], dim=-1)
         if self.use_lstm:
-            h_in = (hidden[0].unsqueeze(0), hidden[1].unsqueeze(0))
-            h_out, c_out = self.rnn(rnn_input.unsqueeze(0), h_in)
-            hidden_new = (h_out.squeeze(0), c_out.squeeze(0))
+            hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
         elif self.use_gru:
-            h_new_t = self.rnn(rnn_input.unsqueeze(0), hidden.unsqueeze(0)).squeeze(0)
-            hidden_new = h_new_t
+            hidden_new = self.rnn(rnn_input, hidden)
+            h_new_t = hidden_new
         else:
             h_new_t = self.rnn(rnn_input, h_t)
             hidden_new = h_new_t
@@ -192,80 +210,90 @@ class Tallerman(BaseAutomata):
         h_new_t = self.ln_out(h_new_t + h_t)
 
         # 3. Tape actions
-        action_logits = self.W_a @ h_new_t + self.b_a
-        a_t = F.softmax(action_logits.reshape(self.num_heads, 5), dim=-1)
+        action_logits = h_new_t @ self.W_a.T + self.b_a
+        a_t = F.softmax(action_logits.reshape(B, self.num_heads, 5), dim=-1)
 
         # 4. Write
-        n_t_all = F.relu(self.ln_write1(self.write_l1(h_new_t)))
-        n_t_all = F.relu(self.ln_write2(self.write_l2(n_t_all)))
-        n_t_all = self.write_l3(n_t_all).reshape(self.num_heads, self.memory_cell_size)
+        n_t_all = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
+        n_t_all = F.gelu(self.ln_write2(self.write_l2(n_t_all)))
+        n_t_all = self.write_l3(n_t_all).reshape(B, self.num_heads, self.memory_cell_size)
 
-        g_t = torch.sigmoid(self.write_gate(h_new_t))
-        e_t = torch.sigmoid(self.erase_gate(h_new_t))
+        g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
+        e_t = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
 
-        memory_new_list   = []
-        pos_tape_new_list = []
+        # Gated write at position 0
+        # memory: (B, num_heads, memory_size, cell_size)
+        written = memory[:, :, 0] * (1 - e_t) + g_t * n_t_all # (B, num_heads, cell_size)
+        
+        m_h_w = memory.clone()
+        m_h_w[:, :, 0] = written
 
-        for h in range(self.num_heads):
-            m_h = memory[h]
-            # Gated write at position 0
-            write_mask = torch.zeros(self.memory_size, 1, device=m_h.device)
-            write_mask[0, 0] = 1.0
+        # Tape roll - vectorizing across batch for fixed shifts
+        # shifts = 0, 1, -1, jl, -jl
+        # We need to handle per-batch jump lengths. 
+        # For simplicity, if jl is uniform across batch (usual case in current trainer), 
+        # we can still use torch.roll.
+        
+        jl = int(jump_len[0].item()) if jump_len.dim() > 0 else int(jump_len.item())
+        
+        def roll_and_weight(tensor, action_weights):
+            # tensor: (B, num_heads, memory_size, D)
+            # action_weights: (B, num_heads, 5)
+            r0 = tensor
+            r1 = torch.roll(tensor, shifts=1,   dims=2)
+            r2 = torch.roll(tensor, shifts=-1,  dims=2)
+            r3 = torch.roll(tensor, shifts=jl,  dims=2)
+            r4 = torch.roll(tensor, shifts=-jl, dims=2)
             
-            written = m_h[0] * (1 - e_t[h]) + g_t[h] * n_t_all[h]
-            m_h_w = m_h * (1 - write_mask) + written.unsqueeze(0) * write_mask
+            w = action_weights.unsqueeze(-1).unsqueeze(-1) # (B, num_heads, 5, 1, 1)
+            stacked = torch.stack([r0, r1, r2, r3, r4], dim=2) # (B, num_heads, 5, memory_size, D)
+            return (w * stacked).sum(dim=2)
 
-            # Tape roll
-            jl = int(jump_len.item()) if hasattr(jump_len, 'item') else int(jump_len)
-            m_h_new = (
-                a_t[h, 0] * m_h_w +
-                a_t[h, 1] * torch.roll(m_h_w, shifts=1,   dims=0) +
-                a_t[h, 2] * torch.roll(m_h_w, shifts=-1,  dims=0) +
-                a_t[h, 3] * torch.roll(m_h_w, shifts=jl,  dims=0) +
-                a_t[h, 4] * torch.roll(m_h_w, shifts=-jl, dims=0)
-            )
-            memory_new_list.append(m_h_new)
-
-            p_h = pos_tape[h]
-            p_h_new = (
-                a_t[h, 0] * p_h +
-                a_t[h, 1] * torch.roll(p_h, shifts=1,   dims=0) +
-                a_t[h, 2] * torch.roll(p_h, shifts=-1,  dims=0) +
-                a_t[h, 3] * torch.roll(p_h, shifts=jl,  dims=0) +
-                a_t[h, 4] * torch.roll(p_h, shifts=-jl, dims=0)
-            )
-            pos_tape_new_list.append(p_h_new)
-
-        memory_new   = torch.stack(memory_new_list)
-        pos_tape_new = torch.stack(pos_tape_new_list)
+        memory_new = roll_and_weight(m_h_w, a_t)
+        pos_tape_new = roll_and_weight(pos_tape, a_t)
 
         return h_new_t, hidden_new, memory_new, pos_tape_new
 
     def forward(self, inputs: torch.Tensor, state: TallermanState, pad_mask: torch.Tensor, input_length=None):
-        T = inputs.shape[0]
-        jump_len = input_length if input_length is not None else torch.tensor(T, device=inputs.device)
+        """
+        Args:
+            inputs: (B, T, embedding_dim)
+            state: TallermanState
+            pad_mask: (B, T) bool
+            input_length: (B,) int
+        """
+        B, T, _ = inputs.shape
+        if input_length is None:
+            input_length = torch.full((B,), T, device=inputs.device, dtype=torch.long)
+        elif not isinstance(input_length, torch.Tensor):
+            input_length = torch.full((B,), input_length, device=inputs.device, dtype=torch.long)
+        
+        # jump_len must be uniform across batch for vectorized roll to be simple.
+        # Current trainer uses uniform length per batch.
+        jump_len = input_length
 
         current_state = state
         hidden_states = []
 
         for t in range(T):
-            x_t      = inputs[t]
-            is_valid = pad_mask[t]
+            x_t      = inputs[:, t]        # (B, embedding_dim)
+            is_valid = pad_mask[:, t]     # (B,)
 
             h_new_t, hidden_new, memory_new, pos_tape_new = self._step(x_t, current_state, jump_len)
 
+            # Update state only for valid tokens
             if self.use_lstm:
-                frozen_h = tuple(
-                    torch.where(is_valid, hn, ho)
-                    for hn, ho in zip(hidden_new, current_state.hidden)
+                new_h = (
+                    torch.where(is_valid.unsqueeze(-1), hidden_new[0], current_state.hidden[0]),
+                    torch.where(is_valid.unsqueeze(-1), hidden_new[1], current_state.hidden[1])
                 )
             else:
-                frozen_h = torch.where(is_valid, hidden_new, current_state.hidden)
+                new_h = torch.where(is_valid.unsqueeze(-1), hidden_new, current_state.hidden)
 
-            frozen_mem   = torch.where(is_valid.unsqueeze(-1).unsqueeze(-1), memory_new,   current_state.memory)
-            frozen_pos   = torch.where(is_valid.unsqueeze(-1).unsqueeze(-1), pos_tape_new, current_state.pos_tape)
+            new_mem = torch.where(is_valid.view(B, 1, 1, 1), memory_new, current_state.memory)
+            new_pos = torch.where(is_valid.view(B, 1, 1, 1), pos_tape_new, current_state.pos_tape)
 
-            current_state = TallermanState(memory=frozen_mem, hidden=frozen_h, pos_tape=frozen_pos)
+            current_state = TallermanState(memory=new_mem, hidden=new_h, pos_tape=new_pos)
             hidden_states.append(h_new_t)
 
-        return torch.stack(hidden_states, dim=0), current_state
+        return torch.stack(hidden_states, dim=1), current_state

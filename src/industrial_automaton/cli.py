@@ -118,32 +118,64 @@ def cli():
         first_task_meta = all_task_metadata[0]
 
         # Build model (shared across all tasks)
-        if settings.model == "tape_rnn":
-            raise ValueError("tape_rnn uses TorchTrainer and is not supported in multi-task mode yet. Use a single --task instead.")
-        config_cls, model_cls = {
-            "baby_ntm": (BabyNTMModelConfig, BabyNTM),
-            "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
-            "transformer": (TransformerConfig, Transformer),
-            "lstm": (LSTMConfig, LSTM),
-        }.get(settings.model, (None, None))
-        if config_cls is None:
-            raise ValueError(f"Unknown model: {settings.model}")
+        use_torch = (settings.model in ("tape_rnn", "tallerman"))
         model_kwargs = settings.model_kwargs.copy()
         if settings.embedding_type == "one_hot":
             model_kwargs["embedding_dim"] = VOCAB_SIZE
-        config = config_cls(**model_kwargs)
-        model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
-        num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
-        print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
 
-        trainer = Trainer(
-            model, settings,
-            task_metadata=first_task_meta,
-            eval_inputs=first_eval_inputs,
-            eval_labels=first_eval_targets,
-            eval_loss_mask=first_eval_mask,
-            eval_dataset_size=settings.eval_dataset_size,
-        )
+        if use_torch:
+            import torch
+            from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
+            from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+            from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
+            from industrial_automaton.trainer_torch import TorchTrainer, make_generator
+
+            if settings.model == "tape_rnn":
+                config = TapeRNNConfig(**model_kwargs)
+                model_cls = TapeRNN
+            elif settings.model == "tallerman":
+                config = TallermanConfig(**model_kwargs)
+                model_cls = Tallerman
+            else:
+                raise ValueError(f"Unknown torch model: {settings.model}")
+
+            generator = make_generator(settings.seed)
+            model = TorchModelPipeline(config, model_cls, embedding_type=settings.embedding_type, generator=generator)
+            num_params = sum(p.numel() for p in model.parameters())
+            print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+
+            trainer = TorchTrainer(
+                model, settings,
+                task_metadata=first_task_meta,
+                eval_inputs=first_eval_inputs,
+                eval_labels=first_eval_targets,
+                eval_loss_mask=first_eval_mask,
+                eval_dataset_size=settings.eval_dataset_size,
+            )
+        else:
+            from industrial_automaton.trainer_jx import Trainer, eval_fn, TrainingDivergedError
+            config_cls, model_cls = {
+                "baby_ntm": (BabyNTMModelConfig, BabyNTM),
+                "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
+                "transformer": (TransformerConfig, Transformer),
+                "lstm": (LSTMConfig, LSTM),
+            }.get(settings.model, (None, None))
+            if config_cls is None:
+                raise ValueError(f"Unknown model: {settings.model}")
+            
+            config = config_cls(**model_kwargs)
+            model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
+            num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
+            print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+
+            trainer = Trainer(
+                model, settings,
+                task_metadata=first_task_meta,
+                eval_inputs=first_eval_inputs,
+                eval_labels=first_eval_targets,
+                eval_loss_mask=first_eval_mask,
+                eval_dataset_size=settings.eval_dataset_size,
+            )
 
         if settings.load_ckpt:
             print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
@@ -152,15 +184,44 @@ def cli():
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:
             history = trainer.fit(data_generator=combined_iter)
-        except TrainingDivergedError as e:
-            print(f"{ANSI.red('Training diverged: ' + str(e))}")
-            return
+        except Exception as e:
+            if "TrainingDivergedError" in str(type(e)):
+                print(f"{ANSI.red('Training diverged: ' + str(e))}")
+                return
+            raise e
 
         print("\n" + "="*50)
         # Per-task evaluation
         print(f"{ANSI.bold('Per-task evaluation:')}")
         for tname, (ei, et, em), tmeta in all_eval_data:
-            metrics = eval_fn(trainer.state.model, settings.eval_dataset_size, ei, et, em, task_metadata=tmeta)
+            if use_torch:
+                # Use a temporary trainer or manual eval for Torch
+                orig_inputs = trainer.eval_inputs
+                orig_labels = trainer.eval_labels
+                orig_mask   = trainer.eval_loss_mask
+                orig_meta   = trainer.output_vocab_mask
+                
+                trainer.eval_inputs = ei
+                trainer.eval_labels = et
+                trainer.eval_loss_mask = em
+                if tmeta and tmeta.get("output_vocab") is not None:
+                    import torch
+                    mask_np = tmeta["output_vocab"].copy()
+                    from industrial_automaton.vocab import YIELD as YIELD_TOKEN
+                    mask_np[YIELD_TOKEN] = True
+                    trainer.output_vocab_mask = torch.tensor(mask_np, dtype=torch.bool, device=trainer.device)
+                else:
+                    trainer.output_vocab_mask = None
+                
+                metrics = trainer.evaluate_full_dataset()
+                
+                trainer.eval_inputs = orig_inputs
+                trainer.eval_labels = orig_labels
+                trainer.eval_loss_mask = orig_mask
+                trainer.output_vocab_mask = orig_meta
+            else:
+                metrics = eval_fn(trainer.state.model, settings.eval_dataset_size, ei, et, em, task_metadata=tmeta)
+            
             tok_acc = float(metrics.aux["token_accuracy"])
             seq_acc = float(metrics.aux["sequence_accuracy"])
             print(f"  {ANSI.blue(tname)}: tok_acc={tok_acc:.4f} | seq_acc={seq_acc:.4f}")
@@ -419,6 +480,8 @@ def cli():
             eval_loss_mask=eval_loss_mask,
             eval_dataset_size=settings.eval_dataset_size,
         )
+        if use_online and curriculum_state is not None:
+            trainer.curriculum_bound = float(curriculum_state.current_bound)
     else:
         trainer = Trainer(
             model,
@@ -447,9 +510,23 @@ def cli():
     # Train
     print(f"{ANSI.bold('Starting training...')}")
     try:
-        history = trainer.fit(
-            data_generator=data_source,
-        )
+        if use_torch and use_online and curriculum is not None:
+            def curriculum_fn(current_bound, step_metrics):
+                nonlocal curriculum_state
+                # Use sequence accuracy for adaptive curriculum if available, else token accuracy
+                acc = step_metrics.aux.get("sequence_accuracy", step_metrics.accuracy)
+                metrics = {"loss": step_metrics.loss, "accuracy": acc}
+                curriculum_state = curriculum.update(curriculum_state, metrics)
+                return float(curriculum_state.current_bound)
+            
+            history = trainer.fit(
+                data_generator=data_source,
+                curriculum_fn=curriculum_fn,
+            )
+        else:
+            history = trainer.fit(
+                data_generator=data_source,
+            )
 
         print("\n" + "="*50)
     
@@ -482,10 +559,10 @@ def cli():
                 inf_model = trainer.model
                 inf_model.eval()
                 with torch.no_grad():
-                    x_t = torch.as_tensor(x_raw, dtype=torch.long, device=trainer.device)
-                    state = inf_model.init_state(device=trainer.device)
+                    x_t = torch.as_tensor(x_raw, dtype=torch.long, device=trainer.device).unsqueeze(0) # (1, T)
+                    state = inf_model.init_state(batch_size=1, device=trainer.device)
                     logits, _ = inf_model(x_t, state)
-                    preds = logits.argmax(dim=-1).cpu().numpy()
+                    preds = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
             else:
                 import jax.numpy as jnp
                 state = trainer.state.model.init_state()

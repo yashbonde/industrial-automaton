@@ -189,6 +189,15 @@ def create_online_batch_generator(
         inp_arrs, tgt_arrs, mask_arrs = _format_examples(
             data["input"], data["output"], hard_array_limit, task_tokens
         )
+        
+        # Trim to actual maximum sequence length found in this batch
+        has_content = (inp_arrs != PAD) | (tgt_arrs != PAD) | (mask_arrs != 0)
+        if has_content.any():
+            actual_max_len = np.max(np.where(has_content)[1]) + 1
+            inp_arrs = inp_arrs[:, :actual_max_len]
+            tgt_arrs = tgt_arrs[:, :actual_max_len]
+            mask_arrs = mask_arrs[:, :actual_max_len]
+            
         return inp_arrs, tgt_arrs, mask_arrs
 
     return generator

@@ -23,7 +23,7 @@ class BaseAutomata(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def init_state(self, device=None):
+    def init_state(self, batch_size=1, device=None):
         """Initialize model-specific state. Returns state or None."""
         pass
 
@@ -32,13 +32,13 @@ class BaseAutomata(nn.Module, ABC):
         """Process embedded token sequence.
 
         Args:
-            inputs:       (T, embedding_dim) float tensor
+            inputs:       (B, T, embedding_dim) float tensor
             state:        model-specific state
-            pad_mask:     (T,) bool tensor — True for real tokens
-            input_length: int tensor, tokens before SEP/YIELD (for TapeRNN jumps)
+            pad_mask:     (B, T) bool tensor — True for real tokens
+            input_length: (B,) int tensor, tokens before SEP/YIELD (for TapeRNN jumps)
 
         Returns:
-            hidden:    (T, output_dim)
+            hidden:    (B, T, output_dim)
             new_state: updated state
         """
         pass
@@ -89,15 +89,18 @@ class CosineEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(self, x):
-        position = x.float().unsqueeze(-1)  # (T, 1)
+        # x: (B, T)
+        shape = x.shape
+        x_flat = x.view(-1)
+        position = x_flat.float().unsqueeze(-1)  # (B*T, 1)
         div_term = torch.exp(
             torch.arange(0, self.embedding_dim, 2, device=x.device, dtype=torch.float32)
             * -(math.log(10000.0) / self.embedding_dim)
         )
-        pe = torch.zeros(x.shape[0], self.embedding_dim, device=x.device)
+        pe = torch.zeros(x_flat.shape[0], self.embedding_dim, device=x.device)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        return pe
+        return pe.view(*shape, self.embedding_dim)
 
 
 class OneHotEmbedding(nn.Module):
@@ -150,31 +153,32 @@ class ModelPipeline(nn.Module):
         self.model = model_cls(config, generator=generator)
         self.head = OutputHead(self.model.output_dim, VOCAB_SIZE)
 
-    def init_state(self, device=None):
-        return self.model.init_state(device=device)
+    def init_state(self, batch_size=1, device=None):
+        return self.model.init_state(batch_size=batch_size, device=device)
 
     def forward(self, x, state):
         """
         Args:
-            x:     (T,) int token indices
+            x:     (B, T) int token indices
             state: model-specific state (from init_state)
 
         Returns:
-            logits:    (T, vocab_size)
+            logits:    (B, T, vocab_size)
             new_state: updated model state
         """
-        pad_mask = (x != PAD)  # (T,) bool
+        pad_mask = (x != PAD)  # (B, T) bool
 
         # input_length = index of first SEP or YIELD (= number of input tokens)
         yield_or_sep = (x == SEP) | (x == YIELD)
+        B, T = x.shape
         positions = torch.where(
             yield_or_sep,
-            torch.arange(x.shape[0], device=x.device),
-            torch.full_like(x, x.shape[0]),
+            torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1),
+            torch.full_like(x, T),
         )
-        input_length = positions.min()
+        input_length = positions.min(dim=1).values # (B,)
 
-        embeds = self.embedding(x)                                   # (T, embedding_dim)
+        embeds = self.embedding(x)                                   # (B, T, embedding_dim)
         hidden, new_state = self.model(embeds, state, pad_mask, input_length=input_length)
-        logits = self.head(hidden)                                   # (T, vocab_size)
+        logits = self.head(hidden)                                   # (B, T, vocab_size)
         return logits, new_state

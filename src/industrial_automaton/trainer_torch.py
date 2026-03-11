@@ -138,57 +138,50 @@ def loss_fn(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Autoregressive cross-entropy loss with PAD/output masking.
 
-    Mirrors trainer_jx.py loss_fn exactly:
-      - output_vocab_mask: (vocab_size,) bool — invalid logits set to -1e9
-      - loss only over positions where loss_mask == 1
-      - Returns mean loss + token_accuracy + sequence_accuracy
-
-    Args:
-        model:             ModelPipeline (or any module with .init_state() + .forward(x, state))
-        batch:             (inputs, targets, loss_mask) — each (B, T) int tensors
-        output_vocab_mask: optional (vocab_size,) bool tensor already on correct device
-
-    Returns:
-        loss:    scalar tensor (differentiable)
-        metrics: dict with token_accuracy and sequence_accuracy (plain floats)
+    Vectorized version: processes the entire batch in one pass.
     """
     inputs, targets, loss_mask = batch
     B, T = inputs.shape
 
-    all_losses    = []
-    all_tok_accs  = []
-    all_seq_accs  = []
+    state = model.init_state(batch_size=B, device=inputs.device)
+    logits, _ = model(inputs, state)  # (B, T, vocab_size)
 
-    for b in range(B):
-        inp  = inputs[b]    # (T,)
-        tgt  = targets[b]   # (T,)
-        mask = loss_mask[b].float()  # (T,)
+    if output_vocab_mask is not None:
+        logits = logits.masked_fill(~output_vocab_mask.view(1, 1, -1), -1e9)
 
-        state   = model.init_state(device=inp.device)
-        logits, _ = model(inp, state)  # (T, vocab_size)
+    # Flatten for cross-entropy
+    logits_flat = logits.view(-1, logits.shape[-1])
+    targets_flat = targets.view(-1)
+    mask_flat = loss_mask.view(-1).float()
 
-        if output_vocab_mask is not None:
-            logits = logits.masked_fill(~output_vocab_mask.unsqueeze(0), -1e9)
+    log_probs = F.log_softmax(logits_flat, dim=-1)
+    target_lp = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
 
-        log_probs       = F.log_softmax(logits, dim=-1)                        # (T, V)
-        target_lp       = log_probs.gather(1, tgt.unsqueeze(1)).squeeze(1)     # (T,)
-        n_out           = mask.sum() + 1e-5
-        loss_b          = -(target_lp * mask).sum() / n_out
-
-        preds           = logits.argmax(dim=-1)                                # (T,)
-        correct         = (preds == tgt).float()
-        tok_acc         = (correct * mask).sum() / n_out
-        seq_acc         = ((correct * mask).sum() == mask.sum()).float()
-
-        all_losses.append(loss_b)
-        all_tok_accs.append(tok_acc)
-        all_seq_accs.append(seq_acc)
-
-    loss       = torch.stack(all_losses).mean()
-    token_acc  = torch.stack(all_tok_accs).mean().item()
-    seq_acc    = torch.stack(all_seq_accs).mean().item()
-
-    return loss, {"token_accuracy": token_acc, "sequence_accuracy": seq_acc}
+    loss_per_token = -target_lp * mask_flat
+    
+    # Per-example sequence accuracy
+    preds_flat = logits_flat.argmax(dim=-1)
+    correct_flat = (preds_flat == targets_flat).float()
+    
+    # Reshape back to (B, T) to compute sequence accuracy
+    correct = (correct_flat * mask_flat).view(B, T)
+    mask = mask_flat.view(B, T)
+    
+    # Seq acc: all masked tokens in an example must be correct
+    # If mask is all 0 (e.g. padding only), we'll handle that
+    seq_correct = (correct.sum(dim=1) == mask.sum(dim=1)).float()
+    
+    # Token accuracy
+    num_output_tokens = mask_flat.sum() + 1e-5
+    token_acc = (correct_flat * mask_flat).sum() / num_output_tokens
+    
+    # Overall loss
+    loss = loss_per_token.sum() / num_output_tokens
+    
+    return loss, {
+        "token_accuracy": token_acc.item(),
+        "sequence_accuracy": seq_correct.mean().item()
+    }
 
 
 # ── Trainer ───────────────────────────────────────────────────────────────────
