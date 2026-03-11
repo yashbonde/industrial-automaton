@@ -34,6 +34,7 @@ class TallermanConfig(BaseModel):
     use_gru:          bool = False
     use_lstm:         bool = False
     num_heads:        int  = 1
+    use_pos_attn:     bool = True
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -67,6 +68,7 @@ class Tallerman(BaseAutomata):
         self.use_gru          = config.use_gru
         self.use_lstm         = config.use_lstm
         self.num_heads        = config.num_heads
+        self.use_pos_attn     = config.use_pos_attn
 
         rnn_input_size = config.embedding_dim + config.hidden_size
 
@@ -94,10 +96,11 @@ class Tallerman(BaseAutomata):
         self._cell_scale = math.sqrt(config.memory_cell_size)
 
         # Positional attention read: query pos_tape to locate target position, read memory there
-        self.W_pq = nn.Parameter(torch.randn(config.pos_dim, config.hidden_size, generator=generator) * scale)
-        self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
-        self.ln_pos_read = nn.LayerNorm(config.hidden_size)
-        self._pos_scale = math.sqrt(config.pos_dim)
+        if config.use_pos_attn:
+            self.W_pq = nn.Parameter(torch.randn(config.pos_dim, config.hidden_size, generator=generator) * scale)
+            self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
+            self.ln_pos_read = nn.LayerNorm(config.hidden_size)
+            self._pos_scale = math.sqrt(config.pos_dim)
 
         # Action logits
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
@@ -216,11 +219,14 @@ class Tallerman(BaseAutomata):
         content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)
 
         # Positional attention: query pos_tape to locate target position, read memory there
-        pos_query = h_t @ self.W_pq.T  # (B, pos_dim)
-        pos_scores = torch.einsum('bc,bnmc->bnm', pos_query, pos_tape) / self._pos_scale
-        pos_attn = F.softmax(pos_scores, dim=-1)  # (B, num_heads, memory_size)
-        pos_value = torch.einsum('bnm,bnmc->bnc', pos_attn, memory)  # read memory at attended pos
-        pos_read = self.ln_pos_read(pos_value.reshape(B, -1) @ self.W_pv.T)
+        if self.use_pos_attn:
+            pos_query = h_t @ self.W_pq.T  # (B, pos_dim)
+            pos_scores = torch.einsum('bc,bnmc->bnm', pos_query, pos_tape) / self._pos_scale
+            pos_attn = F.softmax(pos_scores, dim=-1)  # (B, num_heads, memory_size)
+            pos_value = torch.einsum('bnm,bnmc->bnc', pos_attn, memory)  # read memory at attended pos
+            pos_read = self.ln_pos_read(pos_value.reshape(B, -1) @ self.W_pv.T)
+        else:
+            pos_read = 0
 
         # 2. RNN step
         rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
