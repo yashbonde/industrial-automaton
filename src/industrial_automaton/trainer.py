@@ -512,7 +512,7 @@ class Trainer:
                     eval_token_acc = eval_metrics.aux.get("token_accuracy", 0)
                     eval_seq_acc = eval_metrics.aux.get("sequence_accuracy", 0)
                     eval_acc_str = f" | tok_acc={eval_token_acc:.4f} | seq_acc={eval_seq_acc:.4f}"
-                    final_eval_accuracy = eval_token_acc
+                    final_eval_accuracy = eval_seq_acc
                 self._log(f"  Eval @ {current_step}: loss={eval_loss:.4f}{eval_acc_str}")
                 if eval_loss < best_eval_loss:
                     best_eval_loss = eval_loss
