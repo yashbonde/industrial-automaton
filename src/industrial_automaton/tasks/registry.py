@@ -18,7 +18,7 @@ from .. import vocab as V
 # ============================================================================
 
 _MAX_SEQLEN = 10_000
-_ALPHA = "abcdefghijklmnopqrstuvwxyz"
+_ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
 def _default_rng(rng):
