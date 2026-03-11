@@ -209,14 +209,15 @@ def cli():
     print(f"{ANSI.blue('Vocab size')}: {VOCAB_SIZE}")
 
     # Initialize model based on settings
-    # tape_rnn → PyTorch + TorchTrainer (MPS); all others → JAX + Trainer
-    use_torch = (settings.model == "tape_rnn")
+    # tape_rnn / tallerman → PyTorch + TorchTrainer (MPS); all others → JAX + Trainer
+    use_torch = (settings.model in ("tape_rnn", "tallerman"))
 
     model_kwargs = settings.model_kwargs.copy()
 
     if use_torch:
         import torch
         from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
+        from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
         from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
         from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
@@ -224,9 +225,17 @@ def cli():
             print(f"{ANSI.blue('Using one_hot embedding. Embedding dimension set to vocab size: ' + str(VOCAB_SIZE))}")
             model_kwargs["embedding_dim"] = VOCAB_SIZE
 
-        config = TapeRNNConfig(**model_kwargs)
+        if settings.model == "tape_rnn":
+            config = TapeRNNConfig(**model_kwargs)
+            model_cls = TapeRNN
+        elif settings.model == "tallerman":
+            config = TallermanConfig(**model_kwargs)
+            model_cls = Tallerman
+        else:
+            raise ValueError(f"Unknown torch model: {settings.model}")
+
         generator = make_generator(settings.seed)
-        model = TorchModelPipeline(config, TapeRNN, embedding_type=settings.embedding_type, generator=generator)
+        model = TorchModelPipeline(config, model_cls, embedding_type=settings.embedding_type, generator=generator)
         num_params = sum(p.numel() for p in model.parameters())
         print(f"{ANSI.green('Model')} (via TorchPipeline): {settings.model} [PyTorch/MPS]")
         print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
@@ -522,10 +531,12 @@ def print_model_configs():
     print(f"Legend: {ANSI.red('*')} = Required field")
     
     from industrial_automaton.models_torch.tape import TapeRNNConfig as TorchTapeRNNConfig
+    from industrial_automaton.models_torch.tallerman import TallermanConfig
     configs = {
         "baby_ntm": BabyNTMModelConfig,
         "suzgun_stack_rnn": SuzgunStackRNNConfig,
         "tape_rnn [torch/mps]": TorchTapeRNNConfig,
+        "tallerman [torch/mps]": TallermanConfig,
         "transformer": TransformerConfig,
         "lstm": LSTMConfig,
     }
