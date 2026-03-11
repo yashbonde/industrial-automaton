@@ -118,6 +118,7 @@ class TapeRNN(BaseAutomata):
     write_l1: eqx.nn.Linear        # hidden_size -> 64
     write_l2: eqx.nn.Linear        # 64 -> 64
     write_l3: eqx.nn.Linear        # 64 -> num_heads * memory_cell_size
+    write_gate: eqx.nn.Linear      # hidden_size -> num_heads
     tape_init: jnp.ndarray         # (memory_size, memory_cell_size)
     pos_tape_init: jnp.ndarray     # (memory_size, pos_dim) - static field
 
@@ -132,7 +133,7 @@ class TapeRNN(BaseAutomata):
     num_heads: int = eqx.field(static=True)
 
     def __init__(self, config: TapeRNNConfig, *, key):
-        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
         self.vocab_size = VOCAB_SIZE
         self.embedding_dim = config.embedding_dim
         self.hidden_size = config.hidden_size
@@ -158,10 +159,15 @@ class TapeRNN(BaseAutomata):
         self.W_m = jax.random.normal(k2, (config.hidden_size, config.num_heads * (config.memory_cell_size + config.pos_dim) * 3)) * scale
         self.W_a = jax.random.normal(k3, (config.num_heads * 5, config.hidden_size)) * scale
         
-        # Initial action bias: strongly favor Right movement for all heads
+        # Initial action bias: 
+        # Even heads favor Right movement (scanning)
+        # Odd heads favor Left movement (retrieval)
         bias = np.zeros(config.num_heads * 5)
         for h in range(config.num_heads):
-            bias[h * 5 + 2] = 3.0
+            if h % 2 == 0:
+                bias[h * 5 + 2] = 3.0 # Right
+            else:
+                bias[h * 5 + 1] = 3.0 # Left
         self.b_a = jnp.array(bias)
         
         # MLP write head
@@ -169,6 +175,7 @@ class TapeRNN(BaseAutomata):
         self.write_l1 = eqx.nn.Linear(config.hidden_size, 64, key=k4a)
         self.write_l2 = eqx.nn.Linear(64, 64, key=k4b)
         self.write_l3 = eqx.nn.Linear(64, config.num_heads * config.memory_cell_size, key=k4c)
+        self.write_gate = eqx.nn.Linear(config.hidden_size, config.num_heads, key=k6)
         
         # Learnable tape initialization
         self.tape_init = jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
@@ -219,6 +226,7 @@ class TapeRNN(BaseAutomata):
             windows.append(w)
         
         mem_read = self.W_m @ jnp.concatenate(windows)   # (hidden_size,)
+        mem_read = jnp.tanh(mem_read) # Add non-linearity to read
 
         # 2. RNN Step
         rnn_input = jnp.concatenate([x_t, mem_read])
@@ -229,17 +237,21 @@ class TapeRNN(BaseAutomata):
         action_logits = self.W_a @ h_new_t + self.b_a
         a_t = jax.nn.softmax(action_logits.reshape(self.num_heads, 5), axis=-1)
 
-        # 4. Write to memory tape only
+        # 4. Write to memory tape with gate
         n_t_all = jax.nn.relu(self.write_l1(h_new_t))
         n_t_all = jax.nn.relu(self.write_l2(n_t_all))
         n_t_all = self.write_l3(n_t_all).reshape(self.num_heads, self.memory_cell_size)
+        
+        g_t = jax.nn.sigmoid(self.write_gate(h_new_t)) # (num_heads,)
 
         memory_new_list = []
         pos_tape_new_list = []
         for h in range(self.num_heads):
-            # Update memory tape
+            # Update memory tape: gated write
             m_h = memory[h]
-            m_h_w = m_h.at[0].set(n_t_all[h])
+            # Baby-NTM style gated write at index 0
+            m_h_w = m_h.at[0].set((1 - g_t[h]) * m_h[0] + g_t[h] * n_t_all[h])
+            
             m_h_new = (
                 a_t[h, 0] * m_h_w +
                 a_t[h, 1] * jnp.roll(m_h_w, shift=1, axis=0) +
