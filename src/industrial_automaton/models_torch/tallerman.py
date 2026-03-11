@@ -94,11 +94,6 @@ class Tallerman(BaseAutomata):
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
-        # Per-step attention sharpening (DNC-style): controller emits β_t to sharpen/soften attention
-        self.W_beta = nn.Linear(config.hidden_size, 1)
-        with torch.no_grad():
-            nn.init.normal_(self.W_beta.weight, std=scale, generator=generator)
-            self.W_beta.bias.fill_(1.0)  # init β close to 1 (neutral)
 
         # Positional attention read: query pos_tape to locate target position, read memory there
         if config.use_pos_attn:
@@ -216,10 +211,8 @@ class Tallerman(BaseAutomata):
 
         # Content-based attention read
         query = h_t @ self.W_q.T  # (B, memory_cell_size)  [W_q: cell x hidden → query = h @ W_q^T]
-        # Per-step sharpening: β_t = softplus(h_t @ W_beta) controls attention sharpness
-        beta_t = F.softplus(self.W_beta(h_t))  # (B, 1)
         # scores: (B, num_heads, memory_size)
-        scores = beta_t.unsqueeze(1) * torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
+        scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
         # weighted sum of memory cells: (B, num_heads, memory_cell_size)
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
