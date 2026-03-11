@@ -163,8 +163,17 @@ class TapeRNN(BaseAutomata):
         self.write_l2 = eqx.nn.Linear(64, 64, key=k4b)
         self.write_l3 = eqx.nn.Linear(64, config.num_heads * config.memory_cell_size, key=k4c)
         
-        # Learnable tape initialization
-        self.tape_init = jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
+        # Learnable tape initialization with sinusoidal positional encoding
+        pe = np.zeros((config.memory_size, config.memory_cell_size))
+        position = np.arange(config.memory_size)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, config.memory_cell_size, 2) * -(np.log(10000.0) / config.memory_cell_size))
+        pe[:, 0::2] = np.sin(position * div_term)
+        if config.memory_cell_size % 2 == 1:
+            pe[:, 1::2] = np.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = np.cos(position * div_term)
+        
+        self.tape_init = jnp.array(pe) + jax.random.normal(k5, (config.memory_size, config.memory_cell_size)) * scale
 
     @property
     def output_dim(self) -> int:
