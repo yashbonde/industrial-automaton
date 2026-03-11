@@ -159,15 +159,10 @@ class TapeRNN(BaseAutomata):
         self.W_m = jax.random.normal(k2, (config.hidden_size, config.num_heads * (config.memory_cell_size + config.pos_dim) * 3)) * scale
         self.W_a = jax.random.normal(k3, (config.num_heads * 5, config.hidden_size)) * scale
         
-        # Initial action bias: 
-        # Even heads favor Right movement (scanning)
-        # Odd heads favor Left movement (retrieval)
+        # Initial action bias: strongly favor Right movement for all heads
         bias = np.zeros(config.num_heads * 5)
         for h in range(config.num_heads):
-            if h % 2 == 0:
-                bias[h * 5 + 2] = 3.0 # Right
-            else:
-                bias[h * 5 + 1] = 3.0 # Left
+            bias[h * 5 + 2] = 3.0 # Right
         self.b_a = jnp.array(bias)
         
         # MLP write head
