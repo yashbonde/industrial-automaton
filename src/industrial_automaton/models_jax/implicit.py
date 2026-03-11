@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from industrial_automaton.vocab import SIZE as VOCAB_SIZE
-from industrial_automaton.models.common import BaseAutomata
+from industrial_automaton.models_jax.common import BaseAutomata
 
 class LSTMState(NamedTuple):
     hidden: jnp.ndarray  # (stack_height, embedding_dim)
