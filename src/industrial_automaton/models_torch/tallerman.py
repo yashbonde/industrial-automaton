@@ -94,7 +94,6 @@ class Tallerman(BaseAutomata):
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
-        self.content_temp = nn.Parameter(torch.ones(1))
 
         # Positional attention read: query pos_tape to locate target position, read memory there
         if config.use_pos_attn:
@@ -213,7 +212,7 @@ class Tallerman(BaseAutomata):
         # Content-based attention read
         query = h_t @ self.W_q.T  # (B, memory_cell_size)  [W_q: cell x hidden → query = h @ W_q^T]
         # scores: (B, num_heads, memory_size)
-        scores = torch.einsum('bc,bnmc->bnm', query, memory) * self.content_temp / self._cell_scale
+        scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
         # weighted sum of memory cells: (B, num_heads, memory_cell_size)
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
