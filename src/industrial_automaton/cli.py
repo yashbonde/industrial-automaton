@@ -56,6 +56,8 @@ def _build_task_data(task_name_clean, settings, task_kwargs, eval_kwargs=None):
     )
 
     eval_kw = (eval_kwargs or task_kwargs).copy()
+    if settings.task_kwargs:
+        eval_kw.update(settings.task_kwargs)
     if settings.eval_task_kwargs:
         eval_kw.update(settings.eval_task_kwargs)
     eval_inputs, eval_targets, eval_loss_mask = generate_variable_dataset(
