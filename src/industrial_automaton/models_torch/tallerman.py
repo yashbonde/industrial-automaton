@@ -83,9 +83,15 @@ class Tallerman(BaseAutomata):
         scale = 0.1
         read_dim = config.num_heads * (config.memory_cell_size + config.pos_dim) * 3
 
-        # Memory read projection
+        # Memory read projection (windowed positional)
         self.W_m = nn.Parameter(torch.randn(config.hidden_size, read_dim, generator=generator) * scale)
         self.ln_read = nn.LayerNorm(config.hidden_size)
+
+        # Content-based attention read
+        self.W_q = nn.Parameter(torch.randn(config.hidden_size, config.memory_cell_size, generator=generator) * scale)
+        self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
+        self.ln_content = nn.LayerNorm(config.hidden_size)
+        self._cell_scale = math.sqrt(config.memory_cell_size)
 
         # Action logits
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
@@ -194,8 +200,17 @@ class Tallerman(BaseAutomata):
         
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
+        # Content-based attention read
+        query = h_t @ self.W_q.T  # (B, memory_cell_size)
+        # scores: (B, num_heads, memory_size)
+        scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
+        attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
+        # weighted sum of memory cells: (B, num_heads, memory_cell_size)
+        content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
+        content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)
+
         # 2. RNN step
-        rnn_input = torch.cat([x_t, mem_read], dim=-1)
+        rnn_input = torch.cat([x_t, mem_read + content_read], dim=-1)
         if self.use_lstm:
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
