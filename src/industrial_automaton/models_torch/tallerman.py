@@ -107,10 +107,7 @@ class Tallerman(BaseAutomata):
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
         b_a = torch.zeros(config.num_heads * 5)
         for h in range(config.num_heads):
-            if h == 0:
-                b_a[h * 5 + 2] = 3.0  # Head 0: Right bias (sequence advance)
-            else:
-                b_a[h * 5 + 0] = 3.0  # Head h>0: Stay bias (lookup head)
+            b_a[h * 5 + 2] = 3.0  # Right
         self.b_a = nn.Parameter(b_a)
 
         # MLP write head
