@@ -42,7 +42,7 @@ class VegStewConfig(BaseModel):
     embedding_dim: int  = 16
     hidden_size:   int  = 256
     memory_size:   int  = 60
-    key_size:      int  = 8    # key half of memory cell
+    key_size:      int  = 16   # key half of memory cell
     val_size:      int  = 8    # value half of memory cell
     pos_dim:       int  = 16
     use_gru:       bool = False
