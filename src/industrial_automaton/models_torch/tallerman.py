@@ -36,6 +36,7 @@ class TallermanConfig(BaseModel):
     num_heads:        int  = 1
     use_pos_attn:     bool = True
     write_hidden:     int  = 64
+    window_size:      int  = 3
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -70,6 +71,7 @@ class Tallerman(BaseAutomata):
         self.use_lstm         = config.use_lstm
         self.num_heads        = config.num_heads
         self.use_pos_attn     = config.use_pos_attn
+        self.window_size      = config.window_size
 
         rnn_input_size = config.embedding_dim + config.hidden_size
 
@@ -84,7 +86,7 @@ class Tallerman(BaseAutomata):
             self.rnn = VanillaRNNCell(rnn_input_size, config.hidden_size, generator=generator)
 
         scale = 0.1
-        read_dim = config.num_heads * (config.memory_cell_size + config.pos_dim) * 3
+        read_dim = config.num_heads * (config.memory_cell_size + config.pos_dim) * config.window_size
 
         # Memory read projection (windowed positional)
         self.W_m = nn.Parameter(torch.randn(config.hidden_size, read_dim, generator=generator) * scale)
@@ -199,15 +201,11 @@ class Tallerman(BaseAutomata):
         # Concatenate memory and positional tape for reading
         combined = torch.cat([memory, pos_tape], dim=-1)  # (B, num_heads, memory_size, cell+pos)
         
-        # Windowed read: roll current cell, previous cell, next cell for each head
-        # combined: (B, num_heads, memory_size, C)
-        prev_c = torch.roll(combined, shifts=1, dims=2)
-        next_c = torch.roll(combined, shifts=-1, dims=2)
-        
-        # Read at position 0 for each head
-        # window: (B, num_heads, 3, C) -> (B, num_heads * 3 * C)
-        window = torch.cat([prev_c[:, :, 0], combined[:, :, 0], next_c[:, :, 0]], dim=-1)
-        window = window.reshape(B, -1)
+        # Windowed read: read window_size slots centered at position 0
+        half = self.window_size // 2
+        slots = [torch.roll(combined, shifts=s, dims=2)[:, :, 0]
+                 for s in range(-half, half + 1)]
+        window = torch.cat(slots, dim=-1).reshape(B, -1)
         
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
