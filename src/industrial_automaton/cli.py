@@ -8,14 +8,14 @@ from functools import partial
 import jax
 
 from industrial_automaton.utils import ANSI
-from industrial_automaton.models import (
+from industrial_automaton.models_jax import (
     BabyNTM, BabyNTMModelConfig,
     SuzgunStackRNN, SuzgunStackRNNConfig,
-    TapeRNN, TapeRNNConfig,
     Transformer, TransformerConfig,
     LSTM, LSTMConfig,
     ModelPipeline,
 )
+# TapeRNN lives in models_torch — imported lazily in the tape_rnn branch below
 from industrial_automaton.vocab import SIZE as VOCAB_SIZE
 from industrial_automaton import tasks
 from industrial_automaton.tasks import generate_variable_dataset, create_batch_iterator
@@ -56,6 +56,8 @@ def _build_task_data(task_name_clean, settings, task_kwargs, eval_kwargs=None):
     )
 
     eval_kw = (eval_kwargs or task_kwargs).copy()
+    if settings.task_kwargs:
+        eval_kw.update(settings.task_kwargs)
     if settings.eval_task_kwargs:
         eval_kw.update(settings.eval_task_kwargs)
     eval_inputs, eval_targets, eval_loss_mask = generate_variable_dataset(
@@ -81,7 +83,7 @@ def cli():
     # Import here to not mess up other CLI commands
     from industrial_automaton.config import Settings
     from industrial_automaton.tasks import MASTER_REGISTRY
-    from industrial_automaton.trainer import Trainer, loss_fn, TrainingDivergedError, eval_fn
+    from industrial_automaton.trainer_jx import Trainer, loss_fn, TrainingDivergedError, eval_fn
 
     # Create settings instance (will parse CLI args automatically)
     settings = Settings()
@@ -116,31 +118,64 @@ def cli():
         first_task_meta = all_task_metadata[0]
 
         # Build model (shared across all tasks)
-        config_cls, model_cls = {
-            "baby_ntm": (BabyNTMModelConfig, BabyNTM),
-            "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
-            "tape_rnn": (TapeRNNConfig, TapeRNN),
-            "transformer": (TransformerConfig, Transformer),
-            "lstm": (LSTMConfig, LSTM),
-        }.get(settings.model, (None, None))
-        if config_cls is None:
-            raise ValueError(f"Unknown model: {settings.model}")
+        use_torch = (settings.model in ("tape_rnn", "tallerman"))
         model_kwargs = settings.model_kwargs.copy()
         if settings.embedding_type == "one_hot":
             model_kwargs["embedding_dim"] = VOCAB_SIZE
-        config = config_cls(**model_kwargs)
-        model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
-        num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
-        print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
 
-        trainer = Trainer(
-            model, settings,
-            task_metadata=first_task_meta,
-            eval_inputs=first_eval_inputs,
-            eval_labels=first_eval_targets,
-            eval_loss_mask=first_eval_mask,
-            eval_dataset_size=settings.eval_dataset_size,
-        )
+        if use_torch:
+            import torch
+            from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
+            from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+            from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
+            from industrial_automaton.trainer_torch import TorchTrainer, make_generator
+
+            if settings.model == "tape_rnn":
+                config = TapeRNNConfig(**model_kwargs)
+                model_cls = TapeRNN
+            elif settings.model == "tallerman":
+                config = TallermanConfig(**model_kwargs)
+                model_cls = Tallerman
+            else:
+                raise ValueError(f"Unknown torch model: {settings.model}")
+
+            generator = make_generator(settings.seed)
+            model = TorchModelPipeline(config, model_cls, embedding_type=settings.embedding_type, generator=generator)
+            num_params = sum(p.numel() for p in model.parameters())
+            print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+
+            trainer = TorchTrainer(
+                model, settings,
+                task_metadata=first_task_meta,
+                eval_inputs=first_eval_inputs,
+                eval_labels=first_eval_targets,
+                eval_loss_mask=first_eval_mask,
+                eval_dataset_size=settings.eval_dataset_size,
+            )
+        else:
+            from industrial_automaton.trainer_jx import Trainer, eval_fn, TrainingDivergedError
+            config_cls, model_cls = {
+                "baby_ntm": (BabyNTMModelConfig, BabyNTM),
+                "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
+                "transformer": (TransformerConfig, Transformer),
+                "lstm": (LSTMConfig, LSTM),
+            }.get(settings.model, (None, None))
+            if config_cls is None:
+                raise ValueError(f"Unknown model: {settings.model}")
+            
+            config = config_cls(**model_kwargs)
+            model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
+            num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
+            print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+
+            trainer = Trainer(
+                model, settings,
+                task_metadata=first_task_meta,
+                eval_inputs=first_eval_inputs,
+                eval_labels=first_eval_targets,
+                eval_loss_mask=first_eval_mask,
+                eval_dataset_size=settings.eval_dataset_size,
+            )
 
         if settings.load_ckpt:
             print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
@@ -149,15 +184,44 @@ def cli():
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:
             history = trainer.fit(data_generator=combined_iter)
-        except TrainingDivergedError as e:
-            print(f"{ANSI.red('Training diverged: ' + str(e))}")
-            return
+        except Exception as e:
+            if "TrainingDivergedError" in str(type(e)):
+                print(f"{ANSI.red('Training diverged: ' + str(e))}")
+                return
+            raise e
 
         print("\n" + "="*50)
         # Per-task evaluation
         print(f"{ANSI.bold('Per-task evaluation:')}")
         for tname, (ei, et, em), tmeta in all_eval_data:
-            metrics = eval_fn(trainer.state.model, settings.eval_dataset_size, ei, et, em, task_metadata=tmeta)
+            if use_torch:
+                # Use a temporary trainer or manual eval for Torch
+                orig_inputs = trainer.eval_inputs
+                orig_labels = trainer.eval_labels
+                orig_mask   = trainer.eval_loss_mask
+                orig_meta   = trainer.output_vocab_mask
+                
+                trainer.eval_inputs = ei
+                trainer.eval_labels = et
+                trainer.eval_loss_mask = em
+                if tmeta and tmeta.get("output_vocab") is not None:
+                    import torch
+                    mask_np = tmeta["output_vocab"].copy()
+                    from industrial_automaton.vocab import YIELD as YIELD_TOKEN
+                    mask_np[YIELD_TOKEN] = True
+                    trainer.output_vocab_mask = torch.tensor(mask_np, dtype=torch.bool, device=trainer.device)
+                else:
+                    trainer.output_vocab_mask = None
+                
+                metrics = trainer.evaluate_full_dataset()
+                
+                trainer.eval_inputs = orig_inputs
+                trainer.eval_labels = orig_labels
+                trainer.eval_loss_mask = orig_mask
+                trainer.output_vocab_mask = orig_meta
+            else:
+                metrics = eval_fn(trainer.state.model, settings.eval_dataset_size, ei, et, em, task_metadata=tmeta)
+            
             tok_acc = float(metrics.aux["token_accuracy"])
             seq_acc = float(metrics.aux["sequence_accuracy"])
             print(f"  {ANSI.blue(tname)}: tok_acc={tok_acc:.4f} | seq_acc={seq_acc:.4f}")
@@ -206,31 +270,58 @@ def cli():
     print(f"{ANSI.blue('Vocab size')}: {VOCAB_SIZE}")
 
     # Initialize model based on settings
-    config_cls, model_cls = {
-        "baby_ntm": (BabyNTMModelConfig, BabyNTM),
-        "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
-        "tape_rnn": (TapeRNNConfig, TapeRNN),
-        "transformer": (TransformerConfig, Transformer),
-        "lstm": (LSTMConfig, LSTM),
-    }.get(settings.model, (None, None))
-    if config_cls == None:
-        raise ValueError(f"Unknown model: {settings.model}")
-    
-    # Handle Transformer max_seq_len specifically
+    # tape_rnn / tallerman → PyTorch + TorchTrainer (MPS); all others → JAX + Trainer
+    use_torch = (settings.model in ("tape_rnn", "tallerman"))
+
     model_kwargs = settings.model_kwargs.copy()
-    if settings.model == "transformer" and "max_seq_len" not in model_kwargs:
-        model_kwargs["max_seq_len"] = max(settings.max_seqlen, settings.eval_max_seqlen) * 2
 
-    # handle embedding dim for one_hot
-    if settings.embedding_type == "one_hot":
-        print(f"{ANSI.blue('Using one_hot embedding. Embedding dimension set to vocab size: ' + str(VOCAB_SIZE))}")
-        model_kwargs["embedding_dim"] = VOCAB_SIZE
+    if use_torch:
+        import torch
+        from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
+        from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+        from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
+        from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
-    config = config_cls(**model_kwargs)
-    model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
-    num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
-    print(f"{ANSI.green('Model')} (via Pipeline): {settings.model}")
-    print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+        if settings.embedding_type == "one_hot":
+            print(f"{ANSI.blue('Using one_hot embedding. Embedding dimension set to vocab size: ' + str(VOCAB_SIZE))}")
+            model_kwargs["embedding_dim"] = VOCAB_SIZE
+
+        if settings.model == "tape_rnn":
+            config = TapeRNNConfig(**model_kwargs)
+            model_cls = TapeRNN
+        elif settings.model == "tallerman":
+            config = TallermanConfig(**model_kwargs)
+            model_cls = Tallerman
+        else:
+            raise ValueError(f"Unknown torch model: {settings.model}")
+
+        generator = make_generator(settings.seed)
+        model = TorchModelPipeline(config, model_cls, embedding_type=settings.embedding_type, generator=generator)
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"{ANSI.green('Model')} (via TorchPipeline): {settings.model} [PyTorch/MPS]")
+        print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
+    else:
+        config_cls, model_cls = {
+            "baby_ntm": (BabyNTMModelConfig, BabyNTM),
+            "suzgun_stack_rnn": (SuzgunStackRNNConfig, SuzgunStackRNN),
+            "transformer": (TransformerConfig, Transformer),
+            "lstm": (LSTMConfig, LSTM),
+        }.get(settings.model, (None, None))
+        if config_cls is None:
+            raise ValueError(f"Unknown model: {settings.model}")
+
+        if settings.model == "transformer" and "max_seq_len" not in model_kwargs:
+            model_kwargs["max_seq_len"] = max(settings.max_seqlen, settings.eval_max_seqlen) * 2
+
+        if settings.embedding_type == "one_hot":
+            print(f"{ANSI.blue('Using one_hot embedding. Embedding dimension set to vocab size: ' + str(VOCAB_SIZE))}")
+            model_kwargs["embedding_dim"] = VOCAB_SIZE
+
+        config = config_cls(**model_kwargs)
+        model = ModelPipeline(config, model_cls, embedding_type=settings.embedding_type, key=jax.random.PRNGKey(settings.seed))
+        num_params = sum(x.size for x in jax.tree.leaves(model) if isinstance(x, jax.numpy.ndarray))
+        print(f"{ANSI.green('Model')} (via Pipeline): {settings.model}")
+        print(f"{ANSI.green('Model params')}: {num_params/1e3:.3f} K")
 
     # --- Dataset Generation ---
     # Generate Training Data
@@ -252,6 +343,8 @@ def cli():
     # Generate Evaluation Data
     print(f"{ANSI.blue('Generating evaluation dataset...')}")
     eval_kwargs = task_kwargs.copy()
+    if settings.task_kwargs:
+        eval_kwargs.update(settings.task_kwargs)
     if settings.eval_task_kwargs:
         eval_kwargs.update(settings.eval_task_kwargs)
 
@@ -376,24 +469,37 @@ def cli():
         data_source = data_iterator
         curriculum_state = None
 
-    # Initialize trainer
-    trainer = Trainer(
-        model,
-        settings,
-        task_metadata=task_metadata,
-        curriculum=curriculum,
-        eval_inputs=eval_inputs,
-        eval_labels=eval_targets,
-        eval_loss_mask=eval_loss_mask,
-        eval_dataset_size=settings.eval_dataset_size,
-    )
+    # Initialize trainer — tape_rnn uses TorchTrainer, everything else uses JAX Trainer
+    if use_torch:
+        trainer = TorchTrainer(
+            model,
+            settings,
+            task_metadata=task_metadata,
+            eval_inputs=eval_inputs,
+            eval_labels=eval_targets,
+            eval_loss_mask=eval_loss_mask,
+            eval_dataset_size=settings.eval_dataset_size,
+        )
+        if use_online and curriculum_state is not None:
+            trainer.curriculum_bound = float(curriculum_state.current_bound)
+    else:
+        trainer = Trainer(
+            model,
+            settings,
+            task_metadata=task_metadata,
+            curriculum=curriculum,
+            eval_inputs=eval_inputs,
+            eval_labels=eval_targets,
+            eval_loss_mask=eval_loss_mask,
+            eval_dataset_size=settings.eval_dataset_size,
+        )
 
     if settings.load_ckpt:
         print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
         trainer.load(settings.load_ckpt)
 
-    # Inject pre-built curriculum state for curricula that need it
-    if use_online and curriculum_state is not None:
+    # Inject pre-built curriculum state for curricula that need it (JAX only)
+    if not use_torch and use_online and curriculum_state is not None:
         import equinox as eqx
         trainer.state = eqx.tree_at(
             lambda s: s.curriculum_state,
@@ -404,9 +510,23 @@ def cli():
     # Train
     print(f"{ANSI.bold('Starting training...')}")
     try:
-        history = trainer.fit(
-            data_generator=data_source,
-        )
+        if use_torch and use_online and curriculum is not None:
+            def curriculum_fn(current_bound, step_metrics):
+                nonlocal curriculum_state
+                # Use sequence accuracy for adaptive curriculum if available, else token accuracy
+                acc = step_metrics.aux.get("sequence_accuracy", step_metrics.accuracy)
+                metrics = {"loss": step_metrics.loss, "accuracy": acc}
+                curriculum_state = curriculum.update(curriculum_state, metrics)
+                return float(curriculum_state.current_bound)
+            
+            history = trainer.fit(
+                data_generator=data_source,
+                curriculum_fn=curriculum_fn,
+            )
+        else:
+            history = trainer.fit(
+                data_generator=data_source,
+            )
 
         print("\n" + "="*50)
     
@@ -426,27 +546,34 @@ def cli():
         # Add 5 examples of actual random I/O for the model. I want to see what
         # the model sees and predicts.
         from industrial_automaton.vocab import pretty, YIELD, PAD
-        import jax.numpy as jnp
 
         print("\n" + "="*15 + f" {ANSI.bold('Model Predictions (Eval Set)')} " + "="*15)
-        # Sample 5 random indices from eval set
         indices = np.random.choice(len(eval_inputs), size=min(3, len(eval_inputs)), replace=False)
         for i, idx in enumerate(indices):
             x_raw = eval_inputs[idx]
             tgt_raw = eval_targets[idx]
             mask_raw = eval_loss_mask[idx]
 
-            # Run inference
-            state = trainer.state.model.init_state()
-            logits, _ = trainer.state.model(x_raw, state)
-            preds = jnp.argmax(logits, axis=-1)
+            if use_torch:
+                import torch
+                inf_model = trainer.model
+                inf_model.eval()
+                with torch.no_grad():
+                    x_t = torch.as_tensor(x_raw, dtype=torch.long, device=trainer.device).unsqueeze(0) # (1, T)
+                    state = inf_model.init_state(batch_size=1, device=trainer.device)
+                    logits, _ = inf_model(x_t, state)
+                    preds = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+            else:
+                import jax.numpy as jnp
+                state = trainer.state.model.init_state()
+                logits, _ = trainer.state.model(x_raw, state)
+                preds = jnp.argmax(logits, axis=-1)
 
             # Find YIELD position to split input/output display
             x_list = [int(t) for t in x_raw if int(t) != PAD]
             yield_pos = next((j for j, t in enumerate(x_list) if t == YIELD), len(x_list))
             inp_str = pretty(x_list[:yield_pos])
 
-            # Show target and pred only where mask=1
             mask_positions = np.where(mask_raw == 1)[0]
             if len(mask_positions) > 0:
                 tgt_tokens = [int(tgt_raw[p]) for p in mask_positions]
@@ -480,10 +607,13 @@ def print_model_configs():
     print("="*20 + f" {ANSI.bold('Model Configurations')} " + "="*20)
     print(f"Legend: {ANSI.red('*')} = Required field")
     
+    from industrial_automaton.models_torch.tape import TapeRNNConfig as TorchTapeRNNConfig
+    from industrial_automaton.models_torch.tallerman import TallermanConfig
     configs = {
         "baby_ntm": BabyNTMModelConfig,
         "suzgun_stack_rnn": SuzgunStackRNNConfig,
-        "tape_rnn": TapeRNNConfig,
+        "tape_rnn [torch/mps]": TorchTapeRNNConfig,
+        "tallerman [torch/mps]": TallermanConfig,
         "transformer": TransformerConfig,
         "lstm": LSTMConfig,
     }

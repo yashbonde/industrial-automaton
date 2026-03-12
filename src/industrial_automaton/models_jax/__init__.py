@@ -12,7 +12,8 @@ from .common import ModelPipeline, LearnableEmbedding, OutputHead, BaseAutomata,
 from .implicit import LSTM, LSTMConfig, LSTMState
 from .transformers import Transformer, TransformerConfig, TransformerBlock
 from .stack_rnns import SuzgunStackRNN, SuzgunStackRNNConfig, StackRNNState, BabyNTM, BabyNTMModelConfig, BabyNTMState
-from .tape import TapeRNN, TapeRNNConfig, TapeRNNState
+# TapeRNN moved to models_torch — use TorchTrainer when model="tape_rnn"
+# from .tape import TapeRNN, TapeRNNConfig, TapeRNNState
 
 __all__ = [
     # Common
@@ -24,7 +25,7 @@ __all__ = [
     "Transformer", "TransformerConfig", "TransformerBlock",
     # Stack RNN
     "SuzgunStackRNN", "SuzgunStackRNNConfig", "StackRNNState",
-    # Tape models
+    # Tape models (BabyNTM only — TapeRNN lives in models_torch)
     "BabyNTM", "BabyNTMModelConfig", "BabyNTMState",
-    "TapeRNN", "TapeRNNConfig", "TapeRNNState",
+    # "TapeRNN", "TapeRNNConfig", "TapeRNNState",  # → models_torch
 ]

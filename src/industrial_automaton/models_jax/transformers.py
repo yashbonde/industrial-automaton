@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from industrial_automaton.vocab import SIZE as VOCAB_SIZE
-from industrial_automaton.models.common import BaseAutomata
+from industrial_automaton.models_jax.common import BaseAutomata
 
 class TransformerConfig(BaseModel):
     embedding_dim: int = 32
@@ -79,11 +79,13 @@ class Transformer(BaseAutomata):
     ln_f: eqx.nn.LayerNorm
 
     vocab_size: int = eqx.field(static=True)
+    embedding_dim: int = eqx.field(static=True)
     max_seq_len: int = eqx.field(static=True)
 
     def __init__(self, config: TransformerConfig, *, key):
         k1, k2 = jax.random.split(key, 2)
         self.vocab_size = VOCAB_SIZE
+        self.embedding_dim = config.embedding_dim
         self.max_seq_len = config.max_seq_len
         self.pos_embedding = jax.random.normal(k1, (config.max_seq_len, config.embedding_dim)) * 0.02
 

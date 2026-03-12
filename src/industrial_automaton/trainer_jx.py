@@ -512,7 +512,7 @@ class Trainer:
                     eval_token_acc = eval_metrics.aux.get("token_accuracy", 0)
                     eval_seq_acc = eval_metrics.aux.get("sequence_accuracy", 0)
                     eval_acc_str = f" | tok_acc={eval_token_acc:.4f} | seq_acc={eval_seq_acc:.4f}"
-                    final_eval_accuracy = eval_token_acc
+                    final_eval_accuracy = eval_seq_acc
                 self._log(f"  Eval @ {current_step}: loss={eval_loss:.4f}{eval_acc_str}")
                 if eval_loss < best_eval_loss:
                     best_eval_loss = eval_loss
@@ -594,7 +594,7 @@ class Trainer:
 
         task_metadata = self.task_metadata
 
-        @jax.jit
+        @eqx.filter_jit
         def eval_batch(m, inp, tgt, mask):
             return loss_fn(m, (inp, tgt, mask), jax.random.PRNGKey(0), task_metadata=task_metadata)
 
@@ -689,7 +689,7 @@ def eval_fn(model, eval_dataset_size, eval_inputs, eval_labels, eval_loss_mask=N
     total_token_acc = 0.0
     total_seq_acc = 0.0
 
-    @jax.jit
+    @eqx.filter_jit
     def eval_batch(m, inp, tgt, mask):
         return loss_fn(m, (inp, tgt, mask), jax.random.PRNGKey(0))
 

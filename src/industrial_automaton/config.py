@@ -68,6 +68,7 @@ class Settings(BaseSettings):
             "  - baby_ntm: LSTM + simple 5-op deterministic memory\n"
             "  - suzgun_stack_rnn: RNN + differentiable stack (best for Context-Free)\n"
             "  - tape_rnn: LSTM + differentiable moving-head tape (best for Context-Sensitive)\n"
+            "  - tallerman: Enhanced TapeRNN with LayerNorm and residual connections\n"
             "  - transformer: Standard decoder-only causal Transformer\n"
             "  - lstm: Baseline gated RNN without external memory"
         )

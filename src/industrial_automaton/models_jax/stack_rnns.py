@@ -11,8 +11,8 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from industrial_automaton.vocab import SIZE as VOCAB_SIZE
-from industrial_automaton.models.common import BaseAutomata
-from industrial_automaton.models.tape import build_op_matrices, apply_memory_ops
+from industrial_automaton.models_jax.common import BaseAutomata
+from industrial_automaton.models_jax.tape import build_op_matrices, apply_memory_ops
 
 class StackRNNState(NamedTuple):
     stack: jnp.ndarray    # (Depth, Dim)
