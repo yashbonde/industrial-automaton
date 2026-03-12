@@ -251,6 +251,7 @@ class Tallerman(BaseAutomata):
         n_t_all = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
         n_t_all = F.gelu(self.ln_write2(self.write_l2(n_t_all)))
         n_t_all = self.write_l3(n_t_all).reshape(B, self.num_heads, self.memory_cell_size)
+        n_t_all = F.normalize(n_t_all, dim=-1)  # L2 normalize: stabilise content-attn scores
 
         g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
         e_t = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
