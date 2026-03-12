@@ -91,7 +91,11 @@ class Tallerman(BaseAutomata):
         self.ln_read = nn.LayerNorm(config.hidden_size)
 
         # Content-based attention read — per-head queries for specialization
-        self.W_q = nn.Parameter(torch.randn(config.num_heads, config.memory_cell_size, config.hidden_size, generator=generator) * scale)
+        W_q_data = torch.zeros(config.num_heads, config.memory_cell_size, config.hidden_size)
+        for h in range(config.num_heads):
+            nn.init.orthogonal_(W_q_data[h])
+        W_q_data *= scale
+        self.W_q = nn.Parameter(W_q_data)
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
