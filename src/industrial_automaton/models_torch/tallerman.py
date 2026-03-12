@@ -37,6 +37,7 @@ class TallermanConfig(BaseModel):
     use_pos_attn:     bool = True
     write_hidden:     int  = 64
     window_size:      int  = 3
+    use_input_write:  bool = False  # Add input embedding residual to write vector
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -122,7 +123,10 @@ class Tallerman(BaseAutomata):
         self.write_l3   = nn.Linear(write_hidden, config.num_heads * config.memory_cell_size)
         self.write_gate = nn.Linear(config.hidden_size, config.num_heads)
         self.erase_gate = nn.Linear(config.hidden_size, config.num_heads)
-        
+        self.use_input_write = config.use_input_write
+        if config.use_input_write:
+            self.W_xi = nn.Parameter(torch.randn(config.memory_cell_size, config.embedding_dim, generator=generator) * scale)
+
         for layer in [self.write_l1, self.write_l2, self.write_l3, self.write_gate, self.erase_gate]:
             with torch.no_grad():
                 nn.init.normal_(layer.weight, std=scale, generator=generator)
@@ -252,6 +256,8 @@ class Tallerman(BaseAutomata):
         n_t_all = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
         n_t_all = F.gelu(self.ln_write2(self.write_l2(n_t_all)))
         n_t_all = self.write_l3(n_t_all).reshape(B, self.num_heads, self.memory_cell_size)
+        if self.use_input_write:
+            n_t_all = n_t_all + (x_t @ self.W_xi.T).unsqueeze(1)
 
         g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
         e_t = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
