@@ -53,6 +53,7 @@ class VegStewConfig(BaseModel):
     window_size:   int  = 3
     use_input_write: bool = False
     ema_decay:     float = 0.99   # EMA decay for usage tracking
+    use_soft_write: bool = True   # DNC-style soft write; False = Tallerman slot-0 write (K/V split kept)
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -88,8 +89,9 @@ class VegStew(BaseAutomata):
         self.use_lstm      = config.use_lstm
         self.num_heads     = config.num_heads
         self.use_pos_attn  = config.use_pos_attn
-        self.window_size   = config.window_size
-        self.ema_decay     = config.ema_decay
+        self.window_size    = config.window_size
+        self.ema_decay      = config.ema_decay
+        self.use_soft_write = config.use_soft_write
 
         scale = 0.1
         actual_window_slots = 2 * (config.window_size // 2) + 1
@@ -150,30 +152,36 @@ class VegStew(BaseAutomata):
         if config.use_input_write:
             self.W_xi = nn.Parameter(torch.randn(self.cell_size, config.embedding_dim, generator=generator) * scale)
 
-        # Write gate (scalar per head)
+        # Write gate (scalar per head) — used in both write paths
         self.write_gate = nn.Linear(config.hidden_size, config.num_heads)
         with torch.no_grad():
             nn.init.normal_(self.write_gate.weight, std=scale, generator=generator)
             nn.init.zeros_(self.write_gate.bias)
 
-        # Per-word erase vector (DNC): sigmoid linear → (num_heads * cell_size,)
+        # Per-word erase vector (DNC soft write path): sigmoid linear → (num_heads * cell_size,)
         self.W_erase = nn.Linear(config.hidden_size, config.num_heads * self.cell_size)
         with torch.no_grad():
             nn.init.normal_(self.W_erase.weight, std=scale, generator=generator)
             nn.init.zeros_(self.W_erase.bias)
 
-        # Allocation gate (interpolates content-write vs alloc-write)
-        self.W_alloc_gate = nn.Linear(config.hidden_size, config.num_heads)
+        # Scalar erase gate (simple write path, Tallerman-style at slot 0)
+        self.erase_gate = nn.Linear(config.hidden_size, config.num_heads)
         with torch.no_grad():
-            nn.init.normal_(self.W_alloc_gate.weight, std=scale, generator=generator)
-            nn.init.zeros_(self.W_alloc_gate.bias)
+            nn.init.normal_(self.erase_gate.weight, std=scale, generator=generator)
+            nn.init.zeros_(self.erase_gate.bias)
 
-        # Write content key (to compute content-based write address)
-        self.W_wq = nn.Parameter(torch.randn(config.key_size, config.hidden_size, generator=generator) * scale)
+        if config.use_soft_write:
+            # Allocation gate (interpolates content-write vs alloc-write)
+            self.W_alloc_gate = nn.Linear(config.hidden_size, config.num_heads)
+            with torch.no_grad():
+                nn.init.normal_(self.W_alloc_gate.weight, std=scale, generator=generator)
+                nn.init.zeros_(self.W_alloc_gate.bias)
 
-        # Gaussian locality prior: learned log_sigma per head (σ = exp(log_sigma))
-        # When σ large: uniform; when σ small: concentrated at slot 0
-        self.log_sigma = nn.Parameter(torch.ones(config.num_heads) * math.log(4.0))  # init σ≈4 slots
+            # Write content key (to compute content-based write address)
+            self.W_wq = nn.Parameter(torch.randn(config.key_size, config.hidden_size, generator=generator) * scale)
+
+            # Gaussian locality prior: learned log_sigma per head (σ = exp(log_sigma))
+            self.log_sigma = nn.Parameter(torch.ones(config.num_heads) * math.log(4.0))
 
         # Learnable tape init
         self.tape_init = nn.Parameter(
@@ -191,11 +199,11 @@ class VegStew(BaseAutomata):
             pe[:, 1::2] = np.cos(position * div_term)
         self.register_buffer('pos_tape_init', torch.tensor(pe, dtype=torch.float32))
 
-        # Slot distance buffer for locality prior
-        d = torch.arange(config.memory_size, dtype=torch.float32)
-        # Circular distances from slot 0
-        d = torch.min(d, config.memory_size - d)
-        self.register_buffer('slot_dist', d)  # (N,)
+        if config.use_soft_write:
+            # Slot distance buffer for locality prior
+            d = torch.arange(config.memory_size, dtype=torch.float32)
+            d = torch.min(d, config.memory_size - d)
+            self.register_buffer('slot_dist', d)  # (N,)
 
         # Output norm
         self.ln_out = nn.LayerNorm(config.hidden_size)
@@ -293,42 +301,46 @@ class VegStew(BaseAutomata):
         if self.use_input_write:
             n_t = n_t + (x_t @ self.W_xi.T).unsqueeze(1)
 
-        # ── 7. Per-word erase vector ─────────────────────────────────────────
-        e_t = torch.sigmoid(self.W_erase(h_new_t)).reshape(B, H, self.cell_size)  # (B, H, cell_size)
+        if self.use_soft_write:
+            # ── 7. Per-word erase vector (DNC) ───────────────────────────────
+            e_t = torch.sigmoid(self.W_erase(h_new_t)).reshape(B, H, self.cell_size)
 
-        # ── 8. Write address ─────────────────────────────────────────────────
-        # Content-based write address (query key-half for write)
-        write_query = h_new_t @ self.W_wq.T  # (B, key_size)
-        w_scores = torch.einsum('bk,bhnk->bhn', write_query, key_half) / math.sqrt(self.key_size)
-        content_w = F.softmax(w_scores, dim=-1)  # (B, H, N)
+            # ── 8. Write address ─────────────────────────────────────────────
+            write_query = h_new_t @ self.W_wq.T  # (B, key_size)
+            w_scores = torch.einsum('bk,bhnk->bhn', write_query, key_half) / math.sqrt(self.key_size)
+            content_w = F.softmax(w_scores, dim=-1)
 
-        # Allocation: softmax(-usage), per head same usage
-        alloc_w = F.softmax(-usage.unsqueeze(1).expand(B, H, N), dim=-1)  # (B, H, N)
+            alloc_w = F.softmax(-usage.unsqueeze(1).expand(B, H, N), dim=-1)
+            alloc_gate = torch.sigmoid(self.W_alloc_gate(h_new_t)).unsqueeze(-1)
+            write_addr = (1 - alloc_gate) * content_w + alloc_gate * alloc_w
 
-        # Interpolate
-        alloc_gate = torch.sigmoid(self.W_alloc_gate(h_new_t)).unsqueeze(-1)  # (B, H, 1)
-        write_addr = (1 - alloc_gate) * content_w + alloc_gate * alloc_w  # (B, H, N)
+            sigma = self.log_sigma.exp().clamp(min=0.5)
+            d2 = self.slot_dist.pow(2)
+            locality = torch.exp(-d2.view(1, 1, N) / (2 * sigma.view(1, H, 1).pow(2)))
+            write_addr = write_addr * locality
+            write_addr = write_addr / (write_addr.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Gaussian locality prior centered at slot 0 (current head position)
-        sigma = self.log_sigma.exp().clamp(min=0.5)  # (H,)
-        d2 = self.slot_dist.pow(2)  # (N,)
-        locality = torch.exp(-d2.view(1, 1, N) / (2 * sigma.view(1, H, 1).pow(2)))  # (B, H, N)
-        write_addr = write_addr * locality
-        write_addr = write_addr / (write_addr.sum(dim=-1, keepdim=True) + 1e-8)  # renormalize
+            g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)
+            w_final = g_t * write_addr
 
-        # Write gate
-        g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, H, 1)
-        w_final = g_t * write_addr  # (B, H, N) — effective write weights
+            # ── 9. Update usage (EMA) ─────────────────────────────────────────
+            write_w_sum = w_final.sum(dim=1)
+            usage_new = self.ema_decay * usage + (1 - self.ema_decay) * write_w_sum
 
-        # ── 9. Update usage (EMA) ────────────────────────────────────────────
-        write_w_sum = w_final.sum(dim=1)  # (B, N) sum across heads
-        usage_new = self.ema_decay * usage + (1 - self.ema_decay) * write_w_sum
-
-        # ── 10. Write to memory: M *= (1 - w⊗e); M += w⊗v ─────────────────
-        # w_final: (B, H, N), e_t: (B, H, cell_size) → erase: (B, H, N, cell_size)
-        erase = w_final.unsqueeze(-1) * e_t.unsqueeze(2)   # (B, H, N, cell_size)
-        add   = w_final.unsqueeze(-1) * n_t.unsqueeze(2)   # (B, H, N, cell_size)
-        memory_new = memory * (1 - erase) + add
+            # ── 10. Write: M *= (1 - w⊗e); M += w⊗v ─────────────────────────
+            erase = w_final.unsqueeze(-1) * e_t.unsqueeze(2)
+            add   = w_final.unsqueeze(-1) * n_t.unsqueeze(2)
+            memory_new = memory * (1 - erase) + add
+        else:
+            # ── Simple write: Tallerman slot-0, per-word erase, K/V split ────
+            g_t  = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)   # (B, H, 1)
+            e_t  = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)   # (B, H, 1) scalar per head
+            # Write to slot 0 only
+            written = memory[:, :, 0] * (1 - e_t) + g_t * n_t             # (B, H, cell_size)
+            memory_new = memory.clone()
+            memory_new[:, :, 0] = written
+            usage_new = usage  # no usage tracking in simple write
+            w_final = torch.zeros(B, H, N, device=memory.device, dtype=memory.dtype)
 
         # ── 11. Tape actions ─────────────────────────────────────────────────
         action_logits = h_new_t @ self.W_a.T + self.b_a
