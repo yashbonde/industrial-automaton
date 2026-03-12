@@ -37,7 +37,6 @@ class TallermanConfig(BaseModel):
     use_pos_attn:     bool = True
     write_hidden:     int  = 64
     window_size:      int  = 3
-    jump_bias:        float = 0.0  # extra bias for jump+ and jump- actions
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -111,8 +110,6 @@ class Tallerman(BaseAutomata):
         b_a = torch.zeros(config.num_heads * 5)
         for h in range(config.num_heads):
             b_a[h * 5 + 2] = 3.0  # Right
-            b_a[h * 5 + 3] = config.jump_bias  # jump+
-            b_a[h * 5 + 4] = config.jump_bias  # jump-
         self.b_a = nn.Parameter(b_a)
 
         # MLP write head
