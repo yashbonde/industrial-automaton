@@ -212,7 +212,7 @@ class Tallerman(BaseAutomata):
                  for s in range(-half, half + 1)]
         window = torch.cat(slots, dim=-1).reshape(B, -1)
         
-        mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
+        mem_read = self.ln_read(F.gelu(window @ self.W_m.T))
 
         # Content-based attention read
         query = h_t @ self.W_q.T  # (B, memory_cell_size)
