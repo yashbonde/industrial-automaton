@@ -55,6 +55,7 @@ class VegStewConfig(BaseModel):
     ema_decay:     float = 0.99   # EMA decay for usage tracking
     use_soft_write: bool = True   # DNC-style soft write; False = Tallerman slot-0 write (K/V split kept)
     query_full_cell: bool = False  # If True, W_q maps h_t → cell_size (same precision as Tallerman) instead of key_size
+    read_full_cell: bool = False   # If True, content/pos attention reads full cell instead of val_half (Tallerman-quality reads)
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -94,6 +95,7 @@ class VegStew(BaseAutomata):
         self.ema_decay      = config.ema_decay
         self.use_soft_write = config.use_soft_write
         self.query_full_cell = config.query_full_cell
+        self.read_full_cell = config.read_full_cell
 
         scale = 0.1
         actual_window_slots = 2 * (config.window_size // 2) + 1
@@ -120,16 +122,18 @@ class VegStew(BaseAutomata):
         query_dim = self.cell_size if config.query_full_cell else config.key_size
         self.query_dim = query_dim
         self.W_q = nn.Parameter(torch.randn(query_dim, config.hidden_size, generator=generator) * scale)
-        # W_cv: val-half weighted sum → hidden_size
-        self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.val_size, generator=generator) * scale)
+        # W_cv: read_dim weighted sum → hidden_size (val_size or full cell_size)
+        read_out_dim = self.cell_size if config.read_full_cell else config.val_size
+        self.read_out_dim = read_out_dim
+        self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * read_out_dim, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         # Learned sharpening per head (β)
         self.log_beta = nn.Parameter(torch.zeros(config.num_heads))  # β = exp(log_beta)
 
-        # Positional attention: query pos_tape, read val-half
+        # Positional attention: query pos_tape, read val-half (or full cell)
         if config.use_pos_attn:
             self.W_pq = nn.Parameter(torch.randn(config.pos_dim, config.hidden_size, generator=generator) * scale)
-            self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.val_size, generator=generator) * scale)
+            self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * read_out_dim, generator=generator) * scale)
             self.ln_pos_read = nn.LayerNorm(config.hidden_size)
             self._pos_scale = math.sqrt(config.pos_dim)
 
@@ -271,15 +275,16 @@ class VegStew(BaseAutomata):
         attend_over = memory if self.query_full_cell else key_half  # (B, H, N, query_dim)
         scores = torch.einsum('bk,bhnk->bhn', query, attend_over) * beta.view(1, H, 1) / math.sqrt(self.query_dim)
         attn = F.softmax(scores, dim=-1)  # (B, H, N)
-        content_vec = torch.einsum('bhn,bhnv->bhv', attn, val_half)  # (B, H, val_size)
+        read_src = memory if self.read_full_cell else val_half
+        content_vec = torch.einsum('bhn,bhnv->bhv', attn, read_src)  # (B, H, read_out_dim)
         content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)  # (B, hidden_size)
 
-        # ── 3. Positional attention: query pos_tape, read val-half ──────────
+        # ── 3. Positional attention: query pos_tape, read val-half (or full cell)
         if self.use_pos_attn:
             pos_query = h_t @ self.W_pq.T  # (B, pos_dim)
             pos_scores = torch.einsum('bp,bhnp->bhn', pos_query, pos_tape) / self._pos_scale
             pos_attn = F.softmax(pos_scores, dim=-1)  # (B, H, N)
-            pos_vec = torch.einsum('bhn,bhnv->bhv', pos_attn, val_half)  # (B, H, val_size)
+            pos_vec = torch.einsum('bhn,bhnv->bhv', pos_attn, read_src)  # (B, H, read_out_dim)
             pos_read = self.ln_pos_read(pos_vec.reshape(B, -1) @ self.W_pv.T)  # (B, hidden_size)
         else:
             pos_read = 0
