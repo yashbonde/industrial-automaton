@@ -42,7 +42,7 @@ class VegStewConfig(BaseModel):
     embedding_dim: int  = 16
     hidden_size:   int  = 256
     memory_size:   int  = 60
-    key_size:      int  = 16   # key half of memory cell
+    key_size:      int  = 8    # key half of memory cell
     val_size:      int  = 8    # value half of memory cell
     pos_dim:       int  = 16
     use_gru:       bool = False
@@ -54,6 +54,7 @@ class VegStewConfig(BaseModel):
     use_input_write: bool = False
     ema_decay:     float = 0.99   # EMA decay for usage tracking
     use_soft_write: bool = True   # DNC-style soft write; False = Tallerman slot-0 write (K/V split kept)
+    query_full_cell: bool = False  # If True, W_q maps h_t → cell_size (same precision as Tallerman) instead of key_size
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ class VegStew(BaseAutomata):
         self.window_size    = config.window_size
         self.ema_decay      = config.ema_decay
         self.use_soft_write = config.use_soft_write
+        self.query_full_cell = config.query_full_cell
 
         scale = 0.1
         actual_window_slots = 2 * (config.window_size // 2) + 1
@@ -113,9 +115,11 @@ class VegStew(BaseAutomata):
         self.W_m = nn.Parameter(torch.randn(config.hidden_size, read_dim, generator=generator) * scale)
         self.ln_read = nn.LayerNorm(config.hidden_size)
 
-        # Content read: query key-half, read val-half
-        # W_q: h_t → key_size query
-        self.W_q = nn.Parameter(torch.randn(config.key_size, config.hidden_size, generator=generator) * scale)
+        # Content read: query key-half (or full cell), read val-half
+        # W_q: h_t → query_dim (key_size or cell_size)
+        query_dim = self.cell_size if config.query_full_cell else config.key_size
+        self.query_dim = query_dim
+        self.W_q = nn.Parameter(torch.randn(query_dim, config.hidden_size, generator=generator) * scale)
         # W_cv: val-half weighted sum → hidden_size
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.val_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
@@ -260,11 +264,12 @@ class VegStew(BaseAutomata):
         window = torch.cat(slots, dim=-1).reshape(B, -1)
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))  # (B, hidden_size)
 
-        # ── 2. Content read: query key-half, read val-half ──────────────────
+        # ── 2. Content read: query key-half (or full cell), read val-half ─────
         beta = self.log_beta.exp()  # (H,)
-        query = h_t @ self.W_q.T   # (B, key_size)
-        # scores: (B, H, N)
-        scores = torch.einsum('bk,bhnk->bhn', query, key_half) * beta.view(1, H, 1) / math.sqrt(self.key_size)
+        query = h_t @ self.W_q.T   # (B, query_dim)
+        # When query_full_cell=True, attend over full cell; else key_half only
+        attend_over = memory if self.query_full_cell else key_half  # (B, H, N, query_dim)
+        scores = torch.einsum('bk,bhnk->bhn', query, attend_over) * beta.view(1, H, 1) / math.sqrt(self.query_dim)
         attn = F.softmax(scores, dim=-1)  # (B, H, N)
         content_vec = torch.einsum('bhn,bhnv->bhv', attn, val_half)  # (B, H, val_size)
         content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)  # (B, hidden_size)
