@@ -38,7 +38,6 @@ class TallermanConfig(BaseModel):
     write_hidden:     int  = 64
     window_size:      int  = 3
     use_input_write:  bool = False  # Add input embedding residual to write vector
-    content_temp:     float = 0.0  # Content attention temperature (0 = sqrt(cell_size))
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ class Tallerman(BaseAutomata):
         self.W_q = nn.Parameter(torch.randn(config.memory_cell_size, config.hidden_size, generator=generator) * scale)
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
-        self._cell_scale = float(config.content_temp) if config.content_temp > 0 else math.sqrt(config.memory_cell_size)
+        self._cell_scale = math.sqrt(config.memory_cell_size)
 
         # Positional attention read: query pos_tape to locate target position, read memory there
         if config.use_pos_attn:
