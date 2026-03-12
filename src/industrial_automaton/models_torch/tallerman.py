@@ -94,6 +94,9 @@ class Tallerman(BaseAutomata):
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
+        # Adjacent value read: attend to cell before matched key (value is stored before key in right-roll tape)
+        self.W_adjv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
+        self.ln_adjv = nn.LayerNorm(config.hidden_size)
 
         # Positional attention read: query pos_tape to locate target position, read memory there
         if config.use_pos_attn:
@@ -218,6 +221,11 @@ class Tallerman(BaseAutomata):
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
         content_read = self.ln_content(content_vec.reshape(B, -1) @ self.W_cv.T)
 
+        # Adjacent value read: shift attention by -1 to read value stored just before matched key
+        attn_shifted = torch.roll(attn, shifts=-1, dims=-1)  # (B, num_heads, memory_size)
+        adj_vec = torch.einsum('bnm,bnmc->bnc', attn_shifted, memory)
+        adj_read = self.ln_adjv(adj_vec.reshape(B, -1) @ self.W_adjv.T)
+
         # Positional attention: query pos_tape to locate target position, read memory there
         if self.use_pos_attn:
             pos_query = h_t @ self.W_pq.T  # (B, pos_dim)
@@ -229,7 +237,7 @@ class Tallerman(BaseAutomata):
             pos_read = 0
 
         # 2. RNN step
-        rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
+        rnn_input = torch.cat([x_t, mem_read + content_read + adj_read + pos_read], dim=-1)
         if self.use_lstm:
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
