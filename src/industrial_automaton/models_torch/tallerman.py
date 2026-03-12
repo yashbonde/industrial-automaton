@@ -18,10 +18,9 @@ from industrial_automaton.models_torch.common import BaseAutomata
 
 @dataclass
 class TallermanState:
-    memory:   torch.Tensor  # (B, num_heads, memory_size, memory_cell_size)
+    memory:   torch.Tensor  # (num_heads, memory_size, memory_cell_size)
     hidden:   Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-    pos_tape: torch.Tensor  # (B, num_heads, memory_size, pos_dim) — rolled only
-    h2:       Optional[torch.Tensor] = None  # second layer hidden (num_layers=2)
+    pos_tape: torch.Tensor  # (num_heads, memory_size, pos_dim) — rolled only
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -36,7 +35,6 @@ class TallermanConfig(BaseModel):
     use_lstm:         bool = False
     num_heads:        int  = 1
     use_pos_attn:     bool = True
-    num_layers:       int  = 1
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -71,26 +69,17 @@ class Tallerman(BaseAutomata):
         self.use_lstm         = config.use_lstm
         self.num_heads        = config.num_heads
         self.use_pos_attn     = config.use_pos_attn
-        self.num_layers       = config.num_layers
+
+        rnn_input_size = config.embedding_dim + config.hidden_size
 
         # Controller
-        if config.num_layers == 2:
-            # 2-layer: rnn1 processes input, rnn2 integrates memory read
-            self.rnn = nn.GRUCell(config.embedding_dim, config.hidden_size)
-            self.rnn2 = nn.GRUCell(2 * config.hidden_size, config.hidden_size)
-            self.ln_out2 = nn.LayerNorm(config.hidden_size)
-            self._init_rnn_weights(self.rnn, generator)
-            self._init_rnn_weights(self.rnn2, generator)
-        elif config.use_lstm:
-            rnn_input_size = config.embedding_dim + config.hidden_size
+        if config.use_lstm:
             self.rnn = nn.LSTMCell(rnn_input_size, config.hidden_size)
             self._init_rnn_weights(self.rnn, generator)
         elif config.use_gru:
-            rnn_input_size = config.embedding_dim + config.hidden_size
             self.rnn = nn.GRUCell(rnn_input_size, config.hidden_size)
             self._init_rnn_weights(self.rnn, generator)
         else:
-            rnn_input_size = config.embedding_dim + config.hidden_size
             self.rnn = VanillaRNNCell(rnn_input_size, config.hidden_size, generator=generator)
 
         scale = 0.1
@@ -178,13 +167,10 @@ class Tallerman(BaseAutomata):
         else:
             hidden = torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device)
 
-        h2 = (torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device)
-              if self.num_layers == 2 else None)
         return TallermanState(
             memory=self.tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
             hidden=hidden,
             pos_tape=self.pos_tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
-            h2=h2,
         )
 
     def _step(self, x_t: torch.Tensor, state: TallermanState, jump_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -205,8 +191,6 @@ class Tallerman(BaseAutomata):
         """
         memory, hidden, pos_tape = state.memory, state.hidden, state.pos_tape
         h_t = hidden[0] if self.use_lstm else hidden
-        # For 2-layer: use h2 as memory query (higher-level state)
-        h_query = state.h2 if (self.num_layers == 2 and state.h2 is not None) else h_t
         B = x_t.shape[0]
 
         # 1. Windowed read
@@ -226,7 +210,7 @@ class Tallerman(BaseAutomata):
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
         # Content-based attention read
-        query = h_query @ self.W_q.T  # (B, memory_cell_size)  [W_q: cell x hidden → query = h @ W_q^T]
+        query = h_t @ self.W_q.T  # (B, memory_cell_size)  [W_q: cell x hidden → query = h @ W_q^T]
         # scores: (B, num_heads, memory_size)
         scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
@@ -236,7 +220,7 @@ class Tallerman(BaseAutomata):
 
         # Positional attention: query pos_tape to locate target position, read memory there
         if self.use_pos_attn:
-            pos_query = h_query @ self.W_pq.T  # (B, pos_dim)
+            pos_query = h_t @ self.W_pq.T  # (B, pos_dim)
             pos_scores = torch.einsum('bc,bnmc->bnm', pos_query, pos_tape) / self._pos_scale
             pos_attn = F.softmax(pos_scores, dim=-1)  # (B, num_heads, memory_size)
             pos_value = torch.einsum('bnm,bnmc->bnc', pos_attn, memory)  # read memory at attended pos
@@ -245,36 +229,19 @@ class Tallerman(BaseAutomata):
             pos_read = 0
 
         # 2. RNN step
-        combined_read = mem_read + content_read + pos_read
-        if self.num_layers == 2:
-            # Layer 1: process input sequence
-            h1_new = self.rnn(x_t, h_t)
-            h1_new = self.ln_out(h1_new + h_t)
-            # Layer 2: integrate memory read
-            h2_prev = state.h2
-            h2_new = self.rnn2(torch.cat([h1_new, combined_read], dim=-1), h2_prev)
-            h2_new = self.ln_out2(h2_new + h2_prev)
-            h_new_t = h2_new
-            hidden_new = h1_new
-            h2_out = h2_new
-        elif self.use_lstm:
-            rnn_input = torch.cat([x_t, combined_read], dim=-1)
+        rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
+        if self.use_lstm:
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
-            h_new_t = self.ln_out(h_new_t + h_t)
-            h2_out = None
         elif self.use_gru:
-            rnn_input = torch.cat([x_t, combined_read], dim=-1)
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new
-            h_new_t = self.ln_out(h_new_t + h_t)
-            h2_out = None
         else:
-            rnn_input = torch.cat([x_t, combined_read], dim=-1)
             h_new_t = self.rnn(rnn_input, h_t)
             hidden_new = h_new_t
-            h_new_t = self.ln_out(h_new_t + h_t)
-            h2_out = None
+
+        # LayerNorm and Residual for hidden state
+        h_new_t = self.ln_out(h_new_t + h_t)
 
         # 3. Tape actions
         action_logits = h_new_t @ self.W_a.T + self.b_a
@@ -319,7 +286,7 @@ class Tallerman(BaseAutomata):
         memory_new = roll_and_weight(m_h_w, a_t)
         pos_tape_new = roll_and_weight(pos_tape, a_t)
 
-        return h_new_t, hidden_new, memory_new, pos_tape_new, h2_out
+        return h_new_t, hidden_new, memory_new, pos_tape_new
 
     def forward(self, inputs: torch.Tensor, state: TallermanState, pad_mask: torch.Tensor, input_length=None):
         """
@@ -346,7 +313,7 @@ class Tallerman(BaseAutomata):
             x_t      = inputs[:, t]        # (B, embedding_dim)
             is_valid = pad_mask[:, t]     # (B,)
 
-            h_new_t, hidden_new, memory_new, pos_tape_new, h2_new = self._step(x_t, current_state, jump_len)
+            h_new_t, hidden_new, memory_new, pos_tape_new = self._step(x_t, current_state, jump_len)
 
             # Update state only for valid tokens
             if self.use_lstm:
@@ -359,10 +326,8 @@ class Tallerman(BaseAutomata):
 
             new_mem = torch.where(is_valid.view(B, 1, 1, 1), memory_new, current_state.memory)
             new_pos = torch.where(is_valid.view(B, 1, 1, 1), pos_tape_new, current_state.pos_tape)
-            new_h2 = (torch.where(is_valid.unsqueeze(-1), h2_new, current_state.h2)
-                      if h2_new is not None else None)
 
-            current_state = TallermanState(memory=new_mem, hidden=new_h, pos_tape=new_pos, h2=new_h2)
+            current_state = TallermanState(memory=new_mem, hidden=new_h, pos_tape=new_pos)
             hidden_states.append(h_new_t)
 
         return torch.stack(hidden_states, dim=1), current_state
