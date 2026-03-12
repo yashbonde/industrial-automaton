@@ -37,6 +37,7 @@ class TallermanConfig(BaseModel):
     use_pos_attn:     bool = True
     write_hidden:     int  = 64
     window_size:      int  = 3
+    write_norm:       bool = False  # L2 normalize write vector before tape write
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ class Tallerman(BaseAutomata):
         self.num_heads        = config.num_heads
         self.use_pos_attn     = config.use_pos_attn
         self.window_size      = config.window_size
+        self.write_norm       = config.write_norm
 
         rnn_input_size = config.embedding_dim + config.hidden_size
 
@@ -251,7 +253,8 @@ class Tallerman(BaseAutomata):
         n_t_all = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
         n_t_all = F.gelu(self.ln_write2(self.write_l2(n_t_all)))
         n_t_all = self.write_l3(n_t_all).reshape(B, self.num_heads, self.memory_cell_size)
-        n_t_all = F.normalize(n_t_all, dim=-1)  # L2 normalize: stabilise content-attn scores
+        if self.write_norm:
+            n_t_all = F.normalize(n_t_all, dim=-1)  # L2 normalize: stabilise content-attn scores
 
         g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
         e_t = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
