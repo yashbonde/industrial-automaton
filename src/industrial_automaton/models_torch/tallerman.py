@@ -94,6 +94,7 @@ class Tallerman(BaseAutomata):
 
         # Content-based attention read
         self.W_q = nn.Parameter(torch.randn(config.memory_cell_size, config.hidden_size, generator=generator) * scale)
+        self.W_xq = nn.Parameter(torch.randn(config.memory_cell_size, config.embedding_dim, generator=generator) * scale)
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
@@ -209,8 +210,8 @@ class Tallerman(BaseAutomata):
         
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
-        # Content-based attention read
-        query = h_t @ self.W_q.T  # (B, memory_cell_size)
+        # Content-based attention read (query conditioned on both hidden state and current input)
+        query = h_t @ self.W_q.T + x_t @ self.W_xq.T  # (B, memory_cell_size)
         # scores: (B, num_heads, memory_size)
         scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
