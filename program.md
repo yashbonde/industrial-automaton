@@ -14,7 +14,7 @@ To set up a new experiment, work with the user to:
    - Else, create the branch: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files for full context**:
    - `README.md` — repository overview.
-   - `src/industrial_automaton/models_torch/tallerman.py` — **This is the primary file you will modify.**
+   - `src/industrial_automaton/models_torch/vegstew.py` — **This is the primary file you will modify.**
    - `src/industrial_automaton/config.py` — all configurable CLI arguments.
    - `src/industrial_automaton/trainer_torch.py` — training loop, loss function, evaluation. **You can modify this file too.**
    - Do not edit 
@@ -26,7 +26,7 @@ To set up a new experiment, work with the user to:
 ## What you CANNOT modify
 
 - Any other model file (`baby_ntm`, `lstm`, `stack_rnn`, `transformer`, `implicit.py`,
-  `common.py`) — leave them untouched. We are only iterating on Tallerman architecture.
+  `common.py`) — leave them untouched. We are only iterating on VegStew architecture.
 - `src/industrial_automaton/tasks/` — task definitions and generators are fixed ground truth.
 - `src/industrial_automaton/generators.py` — data generation pipeline is frozen.
 - Install new packages or add new dependencies. Use only what is in `pyproject.toml`.
@@ -41,7 +41,7 @@ honour:
 uv run inmaton \
    --run_name <tag> \ // same as tag from above. Ensure that assets/training_runs/<tag> does not exist.
    --task <task_name> \
-   --model tallerman \
+   --model vegstew \
    --timeout 300 \  // 5-min timeout, super critical
    [args] ...
    > logs/<tag>.log 2>&1
@@ -52,11 +52,13 @@ Redirect everything `> logs/run.log 2>&1` - do NOT use tee or let output flood y
 For curriculum training, add:
 
 ```bash
-   --curriculum_type adaptive \
-   --curriculum_kwargs '{"advance_threshold":0.90,"ema_decay":0.95,"advance_streak":3,"step_size":1,"min_bound":3,"max_bound":12}' \
+--curriculum_type adaptive \
+--curriculum_kwargs '{"advance_threshold":0.90,"ema_decay":0.95,"advance_streak":3,"step_size":1,"min_bound":3,"max_bound":12}' \
 ```
 
 All the bash commands will be run in background (`run_in_background=true`) and then create a wait task on the jobs. You can try to be ambitious and run several bash in parallel and a single wait task to wait for all of them to finish. Thiw say you will be able to save context.
+
+In your compaction summaries do mention the process and a brief about the task and tested hypothesis.
 
 ## Goals and metrics
 
