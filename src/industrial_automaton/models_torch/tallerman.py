@@ -18,10 +18,9 @@ from industrial_automaton.models_torch.common import BaseAutomata
 
 @dataclass
 class TallermanState:
-    memory:    torch.Tensor  # (B, num_heads, memory_size, memory_cell_size)
-    hidden:    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-    pos_tape:  torch.Tensor  # (B, num_heads, memory_size, pos_dim) — rolled only
-    ema_write: Optional[torch.Tensor] = None  # (B, num_heads, memory_size) temporal write trace
+    memory:   torch.Tensor  # (num_heads, memory_size, memory_cell_size)
+    hidden:   Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    pos_tape: torch.Tensor  # (num_heads, memory_size, pos_dim) — rolled only
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -36,7 +35,6 @@ class TallermanConfig(BaseModel):
     use_lstm:         bool = False
     num_heads:        int  = 1
     use_pos_attn:     bool = True
-    use_ema_read:     bool = False
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -71,7 +69,6 @@ class Tallerman(BaseAutomata):
         self.use_lstm         = config.use_lstm
         self.num_heads        = config.num_heads
         self.use_pos_attn     = config.use_pos_attn
-        self.use_ema_read     = config.use_ema_read
 
         rnn_input_size = config.embedding_dim + config.hidden_size
 
@@ -104,12 +101,6 @@ class Tallerman(BaseAutomata):
             self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
             self.ln_pos_read = nn.LayerNorm(config.hidden_size)
             self._pos_scale = math.sqrt(config.pos_dim)
-
-        # EMA write trace read
-        if config.use_ema_read:
-            self.ema_beta = nn.Parameter(torch.tensor(0.9))
-            self.W_ew = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
-            self.ln_ema_read = nn.LayerNorm(config.hidden_size)
 
         # Action logits
         self.W_a = nn.Parameter(torch.randn(config.num_heads * 5, config.hidden_size, generator=generator) * scale)
@@ -176,13 +167,10 @@ class Tallerman(BaseAutomata):
         else:
             hidden = torch.zeros(batch_size, self.hidden_size, dtype=dtype, device=device)
 
-        ema = (torch.zeros(batch_size, self.num_heads, self.memory_size, dtype=dtype, device=device)
-               if self.use_ema_read else None)
         return TallermanState(
             memory=self.tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
             hidden=hidden,
             pos_tape=self.pos_tape_init.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1).clone(),
-            ema_write=ema,
         )
 
     def _step(self, x_t: torch.Tensor, state: TallermanState, jump_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -240,16 +228,8 @@ class Tallerman(BaseAutomata):
         else:
             pos_read = 0
 
-        # EMA temporal read: attend to memory by decayed write trace (tracks recent writes)
-        if self.use_ema_read and state.ema_write is not None:
-            ema_attn = F.softmax(state.ema_write, dim=-1)  # (B, H, M)
-            ema_vec = torch.einsum('bhm,bhmC->bhC', ema_attn, memory)
-            ema_read = self.ln_ema_read(ema_vec.reshape(B, -1) @ self.W_ew.T)
-        else:
-            ema_read = 0
-
         # 2. RNN step
-        rnn_input = torch.cat([x_t, mem_read + content_read + pos_read + ema_read], dim=-1)
+        rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
         if self.use_lstm:
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
@@ -306,17 +286,7 @@ class Tallerman(BaseAutomata):
         memory_new = roll_and_weight(m_h_w, a_t)
         pos_tape_new = roll_and_weight(pos_tape, a_t)
 
-        # EMA write trace update: decay + inject current write, then roll with tape
-        if self.use_ema_read:
-            w_w = torch.zeros(B, self.num_heads, self.memory_size, device=x_t.device)
-            w_w[:, :, 0] = g_t.squeeze(-1)
-            beta = torch.sigmoid(self.ema_beta)
-            ema_updated = beta * state.ema_write + (1 - beta) * w_w
-            ema_new = roll_and_weight(ema_updated.unsqueeze(-1), a_t).squeeze(-1)
-        else:
-            ema_new = None
-
-        return h_new_t, hidden_new, memory_new, pos_tape_new, ema_new
+        return h_new_t, hidden_new, memory_new, pos_tape_new
 
     def forward(self, inputs: torch.Tensor, state: TallermanState, pad_mask: torch.Tensor, input_length=None):
         """
@@ -343,7 +313,7 @@ class Tallerman(BaseAutomata):
             x_t      = inputs[:, t]        # (B, embedding_dim)
             is_valid = pad_mask[:, t]     # (B,)
 
-            h_new_t, hidden_new, memory_new, pos_tape_new, ema_new = self._step(x_t, current_state, jump_len)
+            h_new_t, hidden_new, memory_new, pos_tape_new = self._step(x_t, current_state, jump_len)
 
             # Update state only for valid tokens
             if self.use_lstm:
@@ -356,10 +326,8 @@ class Tallerman(BaseAutomata):
 
             new_mem = torch.where(is_valid.view(B, 1, 1, 1), memory_new, current_state.memory)
             new_pos = torch.where(is_valid.view(B, 1, 1, 1), pos_tape_new, current_state.pos_tape)
-            new_ema = (torch.where(is_valid.view(B, 1, 1), ema_new, current_state.ema_write)
-                       if self.use_ema_read else None)
 
-            current_state = TallermanState(memory=new_mem, hidden=new_h, pos_tape=new_pos, ema_write=new_ema)
+            current_state = TallermanState(memory=new_mem, hidden=new_h, pos_tape=new_pos)
             hidden_states.append(h_new_t)
 
         return torch.stack(hidden_states, dim=1), current_state
