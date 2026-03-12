@@ -21,6 +21,7 @@ To set up a new experiment, work with the user to:
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row (see format
    below). The baseline will be recorded after the first run.
 5. **Confirm and go**: Confirm setup looks good, then kick off experimentation.
+6. **Compaction** (Opt): When compacting you should mention to read this file again.
 
 ## What you CANNOT modify
 
@@ -36,14 +37,14 @@ To set up a new experiment, work with the user to:
 To get the latest arguments run `uv run inmaton -help`. Here's a few fixed arguments you must
 honour:
 
-```bash
+```bash``
 uv run inmaton \
-    --run_name <tag> \ // same as tag from above. Ensure that assets/training_runs/<tag> does not exist.
-    --task <task_name> \
-    --model tallerman \
-    --timeout 300 \  // 5-min timeout, super critical
-    [args] ...
-    > logs/<tag>.log 2>&1
+   --run_name <tag> \ // same as tag from above. Ensure that assets/training_runs/<tag> does not exist.
+   --task <task_name> \
+   --model tallerman \
+   --timeout 300 \  // 5-min timeout, super critical
+   [args] ...
+   > logs/<tag>.log 2>&1
 ```
 
 Redirect everything `> logs/run.log 2>&1` - do NOT use tee or let output flood your context.
@@ -51,9 +52,11 @@ Redirect everything `> logs/run.log 2>&1` - do NOT use tee or let output flood y
 For curriculum training, add:
 
 ```bash
-    --curriculum_type adaptive \
-    --curriculum_kwargs '{"advance_threshold":0.90,"ema_decay":0.95,"advance_streak":3,"step_size":1,"min_bound":3,"max_bound":12}' \
+   --curriculum_type adaptive \
+   --curriculum_kwargs '{"advance_threshold":0.90,"ema_decay":0.95,"advance_streak":3,"step_size":1,"min_bound":3,"max_bound":12}' \
 ```
+
+All the bash commands will be run in background (`run_in_background=true`) and then create a wait task on the jobs. You can try to be ambitious and run several bash in parallel and a single wait task to wait for all of them to finish. Thiw say you will be able to save context.
 
 ## Goals and metrics
 
@@ -137,7 +140,7 @@ The experiment runs on the dedicated autoresearch branch (e.g. `autoresearch/mar
 
 **LOOP FOREVER:**
 
-1. Read config.py, program.md to see if there are any new hyperparameters, changes in instruction.
+1. **Always** reread config.py to see if there are any new hyperparameters and program.md for changes in instruction.
 2. Check git state: `git log --oneline -5` and `git status`. Read few latest experiments in the `./.autoresearch/` folder. Form a hypothesis — what is known from previous experiments, what change might improve seq_acc and why? Create an experiment one pager and save in `./.autoresearch/<tag>.md` file.
 3. Make the change: edit model files, config.py, or the CLI args. Then `git commit -m "brief description of change"`
 4. Train the model and Parse results: `grep -E ...`
