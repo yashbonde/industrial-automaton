@@ -90,8 +90,9 @@ class Tallerman(BaseAutomata):
         self.W_m = nn.Parameter(torch.randn(config.hidden_size, read_dim, generator=generator) * scale)
         self.ln_read = nn.LayerNorm(config.hidden_size)
 
-        # Content-based attention read
-        self.W_q = nn.Parameter(torch.randn(config.memory_cell_size, config.hidden_size, generator=generator) * scale)
+        # Content-based attention read — per-head queries, initialized identically for stability
+        W_q_base = torch.randn(config.memory_cell_size, config.hidden_size, generator=generator) * scale
+        self.W_q = nn.Parameter(W_q_base.unsqueeze(0).expand(config.num_heads, -1, -1).clone())
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
@@ -211,10 +212,11 @@ class Tallerman(BaseAutomata):
         
         mem_read = self.ln_read(torch.tanh(window @ self.W_m.T))
 
-        # Content-based attention read
-        query = h_t @ self.W_q.T  # (B, memory_cell_size)
+        # Content-based attention read — per-head queries
+        # W_q: (num_heads, cell_size, hidden_size); h_t: (B, hidden_size)
+        queries = torch.einsum('bh,nch->bnc', h_t, self.W_q)  # (B, num_heads, cell_size)
         # scores: (B, num_heads, memory_size)
-        scores = torch.einsum('bc,bnmc->bnm', query, memory) / self._cell_scale
+        scores = torch.einsum('bnc,bnmc->bnm', queries, memory) / self._cell_scale
         attn = F.softmax(scores, dim=-1)  # (B, num_heads, memory_size)
         # weighted sum of memory cells: (B, num_heads, memory_cell_size)
         content_vec = torch.einsum('bnm,bnmc->bnc', attn, memory)
