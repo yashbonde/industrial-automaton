@@ -38,6 +38,7 @@ class TallermanConfig(BaseModel):
     write_hidden:     int  = 64
     window_size:      int  = 3
     use_input_write:  bool = False  # Add input embedding residual to write vector
+    fixed_pos_roll:   bool = False  # Roll pos_tape by fixed +1 each step (time counter) instead of following memory actions
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -124,6 +125,7 @@ class Tallerman(BaseAutomata):
         self.write_gate = nn.Linear(config.hidden_size, config.num_heads)
         self.erase_gate = nn.Linear(config.hidden_size, config.num_heads)
         self.use_input_write = config.use_input_write
+        self.fixed_pos_roll = config.fixed_pos_roll
         if config.use_input_write:
             self.W_xi = nn.Parameter(torch.randn(config.memory_cell_size, config.embedding_dim, generator=generator) * scale)
 
@@ -291,7 +293,10 @@ class Tallerman(BaseAutomata):
             return (w * stacked).sum(dim=2)
 
         memory_new = roll_and_weight(m_h_w, a_t)
-        pos_tape_new = roll_and_weight(pos_tape, a_t)
+        if self.fixed_pos_roll:
+            pos_tape_new = torch.roll(pos_tape, shifts=1, dims=2)
+        else:
+            pos_tape_new = roll_and_weight(pos_tape, a_t)
 
         return h_new_t, hidden_new, memory_new, pos_tape_new
 
