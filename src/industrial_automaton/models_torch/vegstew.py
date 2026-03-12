@@ -56,6 +56,7 @@ class VegStewConfig(BaseModel):
     use_soft_write: bool = True   # DNC-style soft write; False = Tallerman slot-0 write (K/V split kept)
     query_full_cell: bool = False  # If True, W_q maps h_t → cell_size (same precision as Tallerman) instead of key_size
     read_full_cell: bool = False   # If True, content/pos attention reads full cell instead of val_half (Tallerman-quality reads)
+    cosine_attn: bool = False      # If True, use cosine similarity for content attention (DNC-style, magnitude-invariant)
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -96,6 +97,7 @@ class VegStew(BaseAutomata):
         self.use_soft_write = config.use_soft_write
         self.query_full_cell = config.query_full_cell
         self.read_full_cell = config.read_full_cell
+        self.cosine_attn = config.cosine_attn
 
         scale = 0.1
         actual_window_slots = 2 * (config.window_size // 2) + 1
@@ -274,7 +276,12 @@ class VegStew(BaseAutomata):
         query = h_t @ self.W_q.T   # (B, query_dim)
         # When query_full_cell=True, attend over full cell; else key_half only
         attend_over = memory if self.query_full_cell else key_half  # (B, H, N, query_dim)
-        scores = torch.einsum('bk,bhnk->bhn', query, attend_over) * beta.view(1, H, 1) / math.sqrt(self.query_dim)
+        if self.cosine_attn:
+            query_n = F.normalize(query, dim=-1)
+            attend_n = F.normalize(attend_over, dim=-1)
+            scores = torch.einsum('bk,bhnk->bhn', query_n, attend_n) * beta.view(1, H, 1)
+        else:
+            scores = torch.einsum('bk,bhnk->bhn', query, attend_over) * beta.view(1, H, 1) / math.sqrt(self.query_dim)
         attn = F.softmax(scores, dim=-1)  # (B, H, N)
         read_src = memory if self.read_full_cell else val_half
         content_vec = torch.einsum('bhn,bhnv->bhv', attn, read_src)  # (B, H, read_out_dim)
