@@ -99,9 +99,12 @@ class Tallerman(BaseAutomata):
         self._cell_scale = math.sqrt(config.memory_cell_size)
 
         # Positional attention read: query pos_tape to locate target position, read memory there
+        # Always consume generator for reproducibility (same downstream init regardless of use_pos_attn)
+        W_pq_data = torch.randn(config.pos_dim, config.hidden_size, generator=generator) * scale
+        W_pv_data = torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale
         if config.use_pos_attn:
-            self.W_pq = nn.Parameter(torch.randn(config.pos_dim, config.hidden_size, generator=generator) * scale)
-            self.W_pv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
+            self.W_pq = nn.Parameter(W_pq_data)
+            self.W_pv = nn.Parameter(W_pv_data)
             self.ln_pos_read = nn.LayerNorm(config.hidden_size)
             self._pos_scale = math.sqrt(config.pos_dim)
 
