@@ -78,7 +78,7 @@ class Tallerman(BaseAutomata):
         # Controller
         if config.use_lstm:
             self.rnn = nn.LSTMCell(rnn_input_size, config.hidden_size)
-            self._init_rnn_weights(self.rnn, generator, use_lstm=True, hidden_size=config.hidden_size)
+            self._init_rnn_weights(self.rnn, generator)
         elif config.use_gru:
             self.rnn = nn.GRUCell(rnn_input_size, config.hidden_size)
             self._init_rnn_weights(self.rnn, generator)
@@ -147,16 +147,13 @@ class Tallerman(BaseAutomata):
         self.ln_out = nn.LayerNorm(config.hidden_size)
 
     @staticmethod
-    def _init_rnn_weights(cell, generator, use_lstm=False, hidden_size=None):
+    def _init_rnn_weights(cell, generator):
         with torch.no_grad():
             for name, p in cell.named_parameters():
                 if 'weight' in name:
                     nn.init.normal_(p, std=0.1, generator=generator)
                 elif 'bias' in name:
                     nn.init.zeros_(p)
-                    if use_lstm and hidden_size is not None:
-                        # Forget gate bias = 1 for better long-range memory retention
-                        p[hidden_size:2 * hidden_size].fill_(1.0)
 
     @property
     def output_dim(self) -> int:
