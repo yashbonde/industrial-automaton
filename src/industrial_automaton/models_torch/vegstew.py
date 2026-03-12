@@ -339,8 +339,8 @@ class VegStew(BaseAutomata):
             written = memory[:, :, 0] * (1 - e_t) + g_t * n_t             # (B, H, cell_size)
             memory_new = memory.clone()
             memory_new[:, :, 0] = written
-            usage_new = usage  # no usage tracking in simple write
-            w_final = torch.zeros(B, H, N, device=memory.device, dtype=memory.dtype)
+            usage_new = usage   # unchanged — not tracked in simple write
+            w_final = None      # not used in simple write
 
         # ── 11. Tape actions ─────────────────────────────────────────────────
         action_logits = h_new_t @ self.W_a.T + self.b_a
@@ -396,10 +396,15 @@ class VegStew(BaseAutomata):
             else:
                 new_h = torch.where(is_valid.unsqueeze(-1), hidden_new, current_state.hidden)
 
-            new_mem  = torch.where(is_valid.view(B, 1, 1, 1), memory_new,   current_state.memory)
-            new_pos  = torch.where(is_valid.view(B, 1, 1, 1), pos_tape_new, current_state.pos_tape)
-            new_usage = torch.where(is_valid.unsqueeze(-1), usage_new, current_state.usage)
-            new_ww   = torch.where(is_valid.view(B, 1, 1), write_w_new, current_state.write_w)
+            new_mem = torch.where(is_valid.view(B, 1, 1, 1), memory_new,   current_state.memory)
+            new_pos = torch.where(is_valid.view(B, 1, 1, 1), pos_tape_new, current_state.pos_tape)
+
+            if self.use_soft_write:
+                new_usage = torch.where(is_valid.unsqueeze(-1), usage_new, current_state.usage)
+                new_ww    = torch.where(is_valid.view(B, 1, 1), write_w_new, current_state.write_w)
+            else:
+                new_usage = current_state.usage   # not tracked
+                new_ww    = current_state.write_w  # not tracked
 
             current_state = VegStewState(
                 memory=new_mem, hidden=new_h, pos_tape=new_pos,
