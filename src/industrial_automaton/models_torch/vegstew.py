@@ -144,14 +144,15 @@ class VegStew(BaseAutomata):
             b_a[h * 5 + 2] = 3.0  # bias toward "right"
         self.b_a = nn.Parameter(b_a)
 
-        # MLP write head (writes to full cell_size)
+        # MLP write head: shared trunk + separate key/val output heads for gradient specialization
         wh = config.write_hidden
-        self.write_l1   = nn.Linear(config.hidden_size, wh)
-        self.ln_write1  = nn.LayerNorm(wh)
-        self.write_l2   = nn.Linear(wh, wh)
-        self.ln_write2  = nn.LayerNorm(wh)
-        self.write_l3   = nn.Linear(wh, config.num_heads * self.cell_size)
-        for layer in [self.write_l1, self.write_l2, self.write_l3]:
+        self.write_l1     = nn.Linear(config.hidden_size, wh)
+        self.ln_write1    = nn.LayerNorm(wh)
+        self.write_l2     = nn.Linear(wh, wh)
+        self.ln_write2    = nn.LayerNorm(wh)
+        self.write_l3_key = nn.Linear(wh, config.num_heads * config.key_size)  # key-half output
+        self.write_l3_val = nn.Linear(wh, config.num_heads * config.val_size)  # val-half output
+        for layer in [self.write_l1, self.write_l2, self.write_l3_key, self.write_l3_val]:
             with torch.no_grad():
                 nn.init.normal_(layer.weight, std=scale, generator=generator)
                 nn.init.zeros_(layer.bias)
@@ -304,10 +305,12 @@ class VegStew(BaseAutomata):
         # ── 5. LN + residual ─────────────────────────────────────────────────
         h_new_t = self.ln_out(h_new_t + h_t)
 
-        # ── 6. Write value (MLP) ─────────────────────────────────────────────
-        n_t = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
-        n_t = F.gelu(self.ln_write2(self.write_l2(n_t)))
-        n_t = self.write_l3(n_t).reshape(B, H, self.cell_size)  # (B, H, cell_size)
+        # ── 6. Write value (MLP with split key/val output heads) ─────────────
+        trunk = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
+        trunk = F.gelu(self.ln_write2(self.write_l2(trunk)))
+        n_key = self.write_l3_key(trunk).reshape(B, H, self.key_size)  # (B, H, key_size)
+        n_val = self.write_l3_val(trunk).reshape(B, H, self.val_size)  # (B, H, val_size)
+        n_t   = torch.cat([n_key, n_val], dim=-1)                      # (B, H, cell_size)
         if self.use_input_write:
             n_t = n_t + (x_t @ self.W_xi.T).unsqueeze(1)
 
