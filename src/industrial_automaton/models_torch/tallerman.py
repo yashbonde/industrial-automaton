@@ -122,8 +122,6 @@ class Tallerman(BaseAutomata):
         self.write_l3   = nn.Linear(write_hidden, config.num_heads * config.memory_cell_size)
         self.write_gate = nn.Linear(config.hidden_size, config.num_heads)
         self.erase_gate = nn.Linear(config.hidden_size, config.num_heads)
-        # Direct input residual for write: stores raw token embedding alongside MLP output
-        self.W_xi = nn.Parameter(torch.randn(config.memory_cell_size, config.embedding_dim, generator=generator) * scale)
         
         for layer in [self.write_l1, self.write_l2, self.write_l3, self.write_gate, self.erase_gate]:
             with torch.no_grad():
@@ -254,8 +252,6 @@ class Tallerman(BaseAutomata):
         n_t_all = F.gelu(self.ln_write1(self.write_l1(h_new_t)))
         n_t_all = F.gelu(self.ln_write2(self.write_l2(n_t_all)))
         n_t_all = self.write_l3(n_t_all).reshape(B, self.num_heads, self.memory_cell_size)
-        # Add input residual: directly encode current token in write vector
-        n_t_all = n_t_all + (x_t @ self.W_xi.T).unsqueeze(1)
 
         g_t = torch.sigmoid(self.write_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
         e_t = torch.sigmoid(self.erase_gate(h_new_t)).unsqueeze(-1)  # (B, num_heads, 1)
