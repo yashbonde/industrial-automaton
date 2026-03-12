@@ -55,6 +55,8 @@ For curriculum training, add:
     --curriculum_kwargs '{"advance_threshold":0.90,"ema_decay":0.95,"advance_streak":3,"step_size":1,"min_bound":3,"max_bound":12}' \
 ```
 
+All the bash commands will be run in background (`run_in_background=true`) and then create a wait task on the jobs. You can try to be ambitious and run several bash in parallel and a single wait task to wait for all of them to finish.
+
 ## Goals and metrics
 
 **The goal**: Train the smallest memory based model to maximise eval `seq_acc` (sequence accuracy — the entire output sequence must be correct) on `repeat_copy_n, deduplicate_inputs, associative_recall, n_back` tasks.
