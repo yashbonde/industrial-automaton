@@ -35,6 +35,7 @@ class TallermanConfig(BaseModel):
     use_lstm:         bool = False
     num_heads:        int  = 1
     use_pos_attn:     bool = True
+    write_hidden:     int  = 64
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -110,11 +111,12 @@ class Tallerman(BaseAutomata):
         self.b_a = nn.Parameter(b_a)
 
         # MLP write head
-        self.write_l1   = nn.Linear(config.hidden_size, 64)
-        self.ln_write1  = nn.LayerNorm(64)
-        self.write_l2   = nn.Linear(64, 64)
-        self.ln_write2  = nn.LayerNorm(64)
-        self.write_l3   = nn.Linear(64, config.num_heads * config.memory_cell_size)
+        write_hidden = config.write_hidden
+        self.write_l1   = nn.Linear(config.hidden_size, write_hidden)
+        self.ln_write1  = nn.LayerNorm(write_hidden)
+        self.write_l2   = nn.Linear(write_hidden, write_hidden)
+        self.ln_write2  = nn.LayerNorm(write_hidden)
+        self.write_l3   = nn.Linear(write_hidden, config.num_heads * config.memory_cell_size)
         self.write_gate = nn.Linear(config.hidden_size, config.num_heads)
         self.erase_gate = nn.Linear(config.hidden_size, config.num_heads)
         
