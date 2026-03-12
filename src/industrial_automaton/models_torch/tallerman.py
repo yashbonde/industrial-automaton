@@ -35,7 +35,6 @@ class TallermanConfig(BaseModel):
     use_lstm:         bool = False
     num_heads:        int  = 1
     use_pos_attn:     bool = True
-    concat_reads:     bool = False
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -70,10 +69,8 @@ class Tallerman(BaseAutomata):
         self.use_lstm         = config.use_lstm
         self.num_heads        = config.num_heads
         self.use_pos_attn     = config.use_pos_attn
-        self.concat_reads     = config.concat_reads
 
-        n_reads = 3 if config.concat_reads else 1
-        rnn_input_size = config.embedding_dim + config.hidden_size * n_reads
+        rnn_input_size = config.embedding_dim + config.hidden_size
 
         # Controller
         if config.use_lstm:
@@ -229,13 +226,10 @@ class Tallerman(BaseAutomata):
             pos_value = torch.einsum('bnm,bnmc->bnc', pos_attn, memory)  # read memory at attended pos
             pos_read = self.ln_pos_read(pos_value.reshape(B, -1) @ self.W_pv.T)
         else:
-            pos_read = torch.zeros_like(mem_read) if self.concat_reads else 0
+            pos_read = 0
 
         # 2. RNN step
-        if self.concat_reads:
-            rnn_input = torch.cat([x_t, mem_read, content_read, pos_read], dim=-1)
-        else:
-            rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
+        rnn_input = torch.cat([x_t, mem_read + content_read + pos_read], dim=-1)
         if self.use_lstm:
             hidden_new = self.rnn(rnn_input, hidden)
             h_new_t = hidden_new[0]
