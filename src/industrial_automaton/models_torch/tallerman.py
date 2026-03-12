@@ -86,7 +86,8 @@ class Tallerman(BaseAutomata):
             self.rnn = VanillaRNNCell(rnn_input_size, config.hidden_size, generator=generator)
 
         scale = 0.1
-        read_dim = config.num_heads * (config.memory_cell_size + config.pos_dim) * config.window_size
+        actual_window_slots = 2 * (config.window_size // 2) + 1
+        read_dim = config.num_heads * (config.memory_cell_size + config.pos_dim) * actual_window_slots
 
         # Memory read projection (windowed positional)
         self.W_m = nn.Parameter(torch.randn(config.hidden_size, read_dim, generator=generator) * scale)
