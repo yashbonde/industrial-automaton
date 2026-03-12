@@ -92,7 +92,7 @@ class Tallerman(BaseAutomata):
 
         # Content-based attention read
         self.W_q = nn.Parameter(torch.randn(config.memory_cell_size, config.hidden_size, generator=generator) * scale)
-        self.W_qx = nn.Parameter(torch.randn(config.memory_cell_size, config.embedding_dim, generator=generator) * scale)
+        self.W_qx = nn.Parameter(torch.zeros(config.memory_cell_size, config.embedding_dim))
         self.W_cv = nn.Parameter(torch.randn(config.hidden_size, config.num_heads * config.memory_cell_size, generator=generator) * scale)
         self.ln_content = nn.LayerNorm(config.hidden_size)
         self._cell_scale = math.sqrt(config.memory_cell_size)
