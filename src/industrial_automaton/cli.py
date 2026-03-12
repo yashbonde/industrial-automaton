@@ -118,7 +118,7 @@ def cli():
         first_task_meta = all_task_metadata[0]
 
         # Build model (shared across all tasks)
-        use_torch = (settings.model in ("tape_rnn", "tallerman"))
+        use_torch = (settings.model in ("tape_rnn", "tallerman", "vegstew"))
         model_kwargs = settings.model_kwargs.copy()
         if settings.embedding_type == "one_hot":
             model_kwargs["embedding_dim"] = VOCAB_SIZE
@@ -127,6 +127,7 @@ def cli():
             import torch
             from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
             from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+            from industrial_automaton.models_torch.vegstew import VegStew, VegStewConfig
             from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
             from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
@@ -136,6 +137,9 @@ def cli():
             elif settings.model == "tallerman":
                 config = TallermanConfig(**model_kwargs)
                 model_cls = Tallerman
+            elif settings.model == "vegstew":
+                config = VegStewConfig(**model_kwargs)
+                model_cls = VegStew
             else:
                 raise ValueError(f"Unknown torch model: {settings.model}")
 
@@ -271,7 +275,7 @@ def cli():
 
     # Initialize model based on settings
     # tape_rnn / tallerman → PyTorch + TorchTrainer (MPS); all others → JAX + Trainer
-    use_torch = (settings.model in ("tape_rnn", "tallerman"))
+    use_torch = (settings.model in ("tape_rnn", "tallerman", "vegstew"))
 
     model_kwargs = settings.model_kwargs.copy()
 
@@ -279,6 +283,7 @@ def cli():
         import torch
         from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
         from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+        from industrial_automaton.models_torch.vegstew import VegStew, VegStewConfig
         from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
         from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
@@ -292,6 +297,9 @@ def cli():
         elif settings.model == "tallerman":
             config = TallermanConfig(**model_kwargs)
             model_cls = Tallerman
+        elif settings.model == "vegstew":
+            config = VegStewConfig(**model_kwargs)
+            model_cls = VegStew
         else:
             raise ValueError(f"Unknown torch model: {settings.model}")
 
@@ -609,11 +617,13 @@ def print_model_configs():
     
     from industrial_automaton.models_torch.tape import TapeRNNConfig as TorchTapeRNNConfig
     from industrial_automaton.models_torch.tallerman import TallermanConfig
+    from industrial_automaton.models_torch.vegstew import VegStewConfig
     configs = {
         "baby_ntm": BabyNTMModelConfig,
         "suzgun_stack_rnn": SuzgunStackRNNConfig,
         "tape_rnn [torch/mps]": TorchTapeRNNConfig,
         "tallerman [torch/mps]": TallermanConfig,
+        "vegstew [torch/mps]": VegStewConfig,
         "transformer": TransformerConfig,
         "lstm": LSTMConfig,
     }
