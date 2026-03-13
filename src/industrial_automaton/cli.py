@@ -182,8 +182,23 @@ def cli():
             )
 
         if settings.load_ckpt:
-            print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
-            trainer.load(settings.load_ckpt)
+            ckpt_path = settings.load_ckpt
+            if ckpt_path == "auto":
+                from pathlib import Path
+                ckpt_dir = Path(settings.save_folder) / settings.run_name / "ckpt"
+                best_link = ckpt_dir / "best"
+                if best_link.exists() or best_link.is_symlink():
+                    ckpt_path = str(best_link.resolve() / "state.pt")
+                else:
+                    step_dirs = sorted(
+                        [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("step-")],
+                        key=lambda d: int(d.name.split("-")[1]),
+                    )
+                    if not step_dirs:
+                        raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+                    ckpt_path = str(step_dirs[-1] / "state.pt")
+            print(f"{ANSI.blue('Loading checkpoint from')} {ckpt_path}...")
+            trainer.load(ckpt_path)
 
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:
@@ -503,8 +518,24 @@ def cli():
         )
 
     if settings.load_ckpt:
-        print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
-        trainer.load(settings.load_ckpt)
+        ckpt_path = settings.load_ckpt
+        if ckpt_path == "auto":
+            from pathlib import Path
+            ckpt_dir = Path(settings.save_folder) / settings.run_name / "ckpt"
+            best_link = ckpt_dir / "best"
+            if best_link.exists() or best_link.is_symlink():
+                ckpt_path = str(best_link.resolve() / "state.pt")
+            else:
+                # Fall back to latest step dir
+                step_dirs = sorted(
+                    [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("step-")],
+                    key=lambda d: int(d.name.split("-")[1]),
+                )
+                if not step_dirs:
+                    raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+                ckpt_path = str(step_dirs[-1] / "state.pt")
+        print(f"{ANSI.blue('Loading checkpoint from')} {ckpt_path}...")
+        trainer.load(ckpt_path)
 
     # Inject pre-built curriculum state for curricula that need it (JAX only)
     if not use_torch and use_online and curriculum_state is not None:

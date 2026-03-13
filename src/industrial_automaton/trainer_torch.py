@@ -258,6 +258,9 @@ class TorchTrainer:
         self.num_output_tokens_produced = 0
         self.unique_input_tokens: set   = set()
 
+        # Resume offset (set by load() when checkpoint contains a step)
+        self.step_offset = 0
+
         # Paths
         from pathlib import Path
         self.run_dir       = Path(settings.save_folder) / settings.run_name
@@ -329,9 +332,12 @@ class TorchTrainer:
         )
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "step" in ckpt:
+            self.step_offset = ckpt["step"]
+            self._log(f"Resumed from step {self.step_offset}")
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -380,9 +386,14 @@ class TorchTrainer:
         best_eval_loss = float("inf")
         final_eval_accuracy = 0.0
 
-        self._log(f"Starting training for {num_steps} steps (device={self.device})")
+        start_step = self.step_offset
+        remaining  = num_steps - start_step
+        if start_step > 0:
+            self._log(f"Resuming from step {start_step}, running {remaining} more steps")
+        else:
+            self._log(f"Starting training for {num_steps} steps (device={self.device})")
 
-        for step_idx in range(num_steps):
+        for step_idx in range(start_step, start_step + remaining):
             # Get batch
             if is_iter:
                 batch = next(data_generator)
