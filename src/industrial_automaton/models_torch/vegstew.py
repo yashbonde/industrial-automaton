@@ -57,6 +57,7 @@ class VegStewConfig(BaseModel):
     query_full_cell: bool = False  # If True, W_q maps h_t → cell_size (same precision as Tallerman) instead of key_size
     read_full_cell: bool = False   # If True, content/pos attention reads full cell instead of val_half (Tallerman-quality reads)
     cosine_attn: bool = False      # If True, use cosine similarity for content attention (DNC-style, magnitude-invariant)
+    use_input_read_query: bool = False  # If True, use x_t directly as read query (bypass RNN) — better for assoc recall
 
 
 # ── Vanilla RNN cell ──────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ class VegStew(BaseAutomata):
         self.query_full_cell = config.query_full_cell
         self.read_full_cell = config.read_full_cell
         self.cosine_attn = config.cosine_attn
+        self.use_input_read_query = config.use_input_read_query
 
         scale = 0.1
         actual_window_slots = 2 * (config.window_size // 2) + 1
@@ -124,6 +126,9 @@ class VegStew(BaseAutomata):
         query_dim = self.cell_size if config.query_full_cell else config.key_size
         self.query_dim = query_dim
         self.W_q = nn.Parameter(torch.randn(query_dim, config.hidden_size, generator=generator) * scale)
+        if config.use_input_read_query:
+            # Direct input read query: x_t → query_dim (bypass RNN, use current token as key)
+            self.W_qi = nn.Parameter(torch.randn(query_dim, config.embedding_dim, generator=generator) * scale)
         # W_cv: read_dim weighted sum → hidden_size (val_size or full cell_size)
         read_out_dim = self.cell_size if config.read_full_cell else config.val_size
         self.read_out_dim = read_out_dim
@@ -273,7 +278,10 @@ class VegStew(BaseAutomata):
 
         # ── 2. Content read: query key-half (or full cell), read val-half ─────
         beta = self.log_beta.exp()  # (H,)
-        query = h_t @ self.W_q.T   # (B, query_dim)
+        if self.use_input_read_query:
+            query = x_t @ self.W_qi.T  # (B, query_dim) — direct from input, bypasses RNN
+        else:
+            query = h_t @ self.W_q.T   # (B, query_dim)
         # When query_full_cell=True, attend over full cell; else key_half only
         attend_over = memory if self.query_full_cell else key_half  # (B, H, N, query_dim)
         if self.cosine_attn:
