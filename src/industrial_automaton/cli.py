@@ -105,14 +105,91 @@ def cli():
 
         for tname in task_names:
             tk = {"rng": np.random.default_rng(settings.seed)}
-            _, train_data, eval_data, tmeta = _build_task_data(tname, settings, tk)
-            ti, tt, tm = train_data
-            print(f"{ANSI.blue(f'  [{tname}]')}: train={ti.shape}, eval={eval_data[0].shape}")
-            all_train_iters.append(create_batch_iterator(ti, tt, tm, batch_size=settings.batch_size, shuffle=True, seed=settings.seed))
+            task_fn, _, eval_data, tmeta = _build_task_data(tname, settings, tk)
+            train_kw = tk.copy()
+            if settings.task_kwargs:
+                train_kw.update(settings.task_kwargs)
+            online_gen = create_online_batch_generator(
+                task_fn,
+                train_kw,
+                batch_size=settings.batch_size,
+                hard_array_limit=settings.hard_array_limit,
+                task_name=tname,
+            )
+            print(f"{ANSI.blue(f'  [{tname}]')}: online-gen, eval={eval_data[0].shape}")
+            all_train_iters.append(online_gen)
             all_eval_data.append((tname, eval_data, tmeta))
             all_task_metadata.append(tmeta)
 
-        combined_iter = _round_robin_iterator(all_train_iters)
+        # Adaptive task sampler — weights tasks by (1 - seq_acc), re-evaluated periodically
+        _mt_min = settings.curriculum_kwargs.get("min_bound", 3)
+        _mt_max = settings.curriculum_kwargs.get("max_bound", settings.max_seqlen)
+        _reweight_interval = settings.curriculum_kwargs.get("reweight_interval", 500)
+        _min_weight = settings.curriculum_kwargs.get("min_weight", 0.05)
+
+        _prefetch_size = settings.curriculum_kwargs.get("prefetch_size", 4)
+
+        class AdaptiveTaskSampler:
+            def __init__(self, generators, eval_data):
+                import queue, threading
+                self.generators = generators
+                self.eval_data = eval_data  # list of (tname, (inputs, targets, mask), tmeta)
+                self.trainer = None         # injected after trainer is built
+                self.accs = [0.0] * len(generators)  # start: all tasks equally unknown → equal weight
+                self.step = 0
+                self._probs = [1.0 / len(generators)] * len(generators)
+                # Prefetch queue — background thread keeps GPU fed
+                self._queue = queue.Queue(maxsize=_prefetch_size)
+                self._stop = threading.Event()
+                self._thread = threading.Thread(target=self._producer, daemon=True)
+                self._thread.start()
+
+            def _sample_batch(self):
+                idx = int(np.random.choice(len(self.generators), p=self._probs))
+                length = int(np.random.randint(_mt_min, _mt_max + 1))
+                return self.generators[idx](length)
+
+            def _producer(self):
+                while not self._stop.is_set():
+                    batch = self._sample_batch()
+                    self._queue.put(batch)
+
+            def _reweight(self):
+                if self.trainer is None:
+                    return
+                import torch
+                from industrial_automaton.trainer_torch import loss_fn
+                model = self.trainer.model
+                device = self.trainer.device
+                model.eval()
+                new_accs = []
+                with torch.no_grad():
+                    for _, (ei, et, em), _ in self.eval_data:
+                        n = min(128, ei.shape[0])
+                        b_in   = torch.tensor(ei[:n], dtype=torch.long, device=device)
+                        b_tgt  = torch.tensor(et[:n], dtype=torch.long, device=device)
+                        b_mask = torch.tensor(em[:n], dtype=torch.float32, device=device)
+                        _, metrics = loss_fn(model, (b_in, b_tgt, b_mask), self.trainer.output_vocab_mask)
+                        new_accs.append(metrics["sequence_accuracy"])
+                model.train()
+                self.accs = new_accs
+                weights = [max(1.0 - a, _min_weight) for a in self.accs]
+                total = sum(weights)
+                self._probs = [w / total for w in weights]
+                names = [ed[0] for ed in self.eval_data]
+                weight_str = "  ".join(f"{n}={w:.2f}" for n, w in zip(names, self._probs))
+                print(f"[AdaptiveSampler] accs={[f'{a:.3f}' for a in self.accs]}  weights={weight_str}")
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.step += 1
+                if self.step % _reweight_interval == 0:
+                    self._reweight()
+                return self._queue.get()
+
+        combined_iter = AdaptiveTaskSampler(all_train_iters, all_eval_data)
         # Use first task's eval for Trainer's built-in early stopping
         first_eval_inputs, first_eval_targets, first_eval_mask = all_eval_data[0][1]
         first_task_meta = all_task_metadata[0]
@@ -199,6 +276,9 @@ def cli():
                     ckpt_path = str(step_dirs[-1] / "state.pt")
             print(f"{ANSI.blue('Loading checkpoint from')} {ckpt_path}...")
             trainer.load(ckpt_path)
+
+        if isinstance(combined_iter, AdaptiveTaskSampler):
+            combined_iter.trainer = trainer
 
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:

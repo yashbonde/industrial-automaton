@@ -2,7 +2,12 @@ import numpy as np
 import inspect
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..vocab import PAD, SEP, YIELD, TASK, D, task_idx
+from ..vocab import PAD, SEP, YIELD, ZERO, TASK, D, task_idx
+
+# Number of ZERO-input thinking steps inserted after YIELD before output begins.
+# Set to 0 to disable. Model receives ZERO tokens with no loss, giving it time
+# to consolidate memory before generating output.
+THINK_STEPS = 3
 
 
 def _format_examples(
@@ -14,11 +19,11 @@ def _format_examples(
     """Format variable-length (input, output) token pairs into padded arrays.
 
     NSL sequence format:
-        [TASK D_t] [input tokens] YIELD [output tokens] EOS
+        [TASK D_t] [input tokens] YIELD [ZERO x THINK_STEPS] [output tokens] EOS
 
     Loss mask:
-        0 for task prefix + input tokens
-        1 for YIELD + output tokens + EOS
+        0 for task prefix + input tokens + YIELD + ZERO think tokens
+        1 for output tokens + EOS
 
     Returns:
         inputs:    (N, hard_array_limit) int64
@@ -35,7 +40,8 @@ def _format_examples(
 
     for b, (inp_tokens, out_tokens) in enumerate(zip(inp_lists, out_lists)):
         full_inp = task_tokens + inp_tokens
-        full_seq = full_inp + [YIELD] + out_tokens
+        think_tokens = [ZERO] * THINK_STEPS
+        full_seq = full_inp + [YIELD] + think_tokens + out_tokens
         if len(full_seq) > hard_array_limit:
             full_seq = full_seq[:hard_array_limit]
         seq_len = len(full_seq)
@@ -45,11 +51,12 @@ def _format_examples(
         if seq_len > 1:
             tgt_arrs[b, :seq_len - 1] = full_seq[1:]
 
-        # Mask=1 starts at YIELD position in the TARGET array.
-        # tgt[full_inp_len - 1] = full_seq[full_inp_len] = YIELD
-        # tgt[full_inp_len] = out_tokens[0], ..., tgt[full_inp_len+len(out)] = EOS
-        out_start = min(full_inp_len - 1, hard_array_limit)  # predicting YIELD
-        out_end = min(full_inp_len + len(out_tokens), seq_len - 1, hard_array_limit)
+        # Mask=1 starts AFTER the think tokens — predicting the first output token.
+        # tgt[full_inp_len - 1] = YIELD (no loss)
+        # tgt[full_inp_len .. full_inp_len + THINK_STEPS - 1] = ZERO tokens (no loss)
+        # tgt[full_inp_len + THINK_STEPS] = out_tokens[0], ..., last = EOS
+        out_start = min(full_inp_len + THINK_STEPS, hard_array_limit)
+        out_end = min(full_inp_len + THINK_STEPS + len(out_tokens), seq_len - 1, hard_array_limit)
         if out_end > out_start:
             mask_arrs[b, out_start:out_end] = 1
 
