@@ -58,7 +58,6 @@ For curriculum training, add:
 
 All the bash commands will be run in background (`run_in_background=true`) and then create a wait task on the jobs. You can try to be ambitious and run several bash in parallel and a single wait task to wait for all of them to finish. Thiw say you will be able to save context.
 
-In your compaction summaries do mention the process and a brief about the task and tested hypothesis.
 
 ## Goals and metrics
 
@@ -135,6 +134,14 @@ d4e5f6g	associative_recall,duplicate_string	0.000	0.000	0.0	0.0	crash	new model 
 ```
 
 All the runs must be logged here, even the crashed one.
+
+## Instruction for compaction summary
+
+In your compaction summaries always mention the following:
+
+1. Read the file `./.ar/vegstew_02.md` as the first thing after compaction to remind where you are and what you are doing.
+2. The process and a brief about the task and tested hypothesis.
+3. The first message that the user sent because we want to keep track of the original user request.
 
 ## The experiment loop
 

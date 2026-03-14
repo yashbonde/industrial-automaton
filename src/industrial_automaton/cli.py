@@ -105,20 +105,97 @@ def cli():
 
         for tname in task_names:
             tk = {"rng": np.random.default_rng(settings.seed)}
-            _, train_data, eval_data, tmeta = _build_task_data(tname, settings, tk)
-            ti, tt, tm = train_data
-            print(f"{ANSI.blue(f'  [{tname}]')}: train={ti.shape}, eval={eval_data[0].shape}")
-            all_train_iters.append(create_batch_iterator(ti, tt, tm, batch_size=settings.batch_size, shuffle=True, seed=settings.seed))
+            task_fn, _, eval_data, tmeta = _build_task_data(tname, settings, tk)
+            train_kw = tk.copy()
+            if settings.task_kwargs:
+                train_kw.update(settings.task_kwargs)
+            online_gen = create_online_batch_generator(
+                task_fn,
+                train_kw,
+                batch_size=settings.batch_size,
+                hard_array_limit=settings.hard_array_limit,
+                task_name=tname,
+            )
+            print(f"{ANSI.blue(f'  [{tname}]')}: online-gen, eval={eval_data[0].shape}")
+            all_train_iters.append(online_gen)
             all_eval_data.append((tname, eval_data, tmeta))
             all_task_metadata.append(tmeta)
 
-        combined_iter = _round_robin_iterator(all_train_iters)
+        # Adaptive task sampler — weights tasks by (1 - seq_acc), re-evaluated periodically
+        _mt_min = settings.curriculum_kwargs.get("min_bound", 3)
+        _mt_max = settings.curriculum_kwargs.get("max_bound", settings.max_seqlen)
+        _reweight_interval = settings.curriculum_kwargs.get("reweight_interval", 500)
+        _min_weight = settings.curriculum_kwargs.get("min_weight", 0.05)
+
+        _prefetch_size = settings.curriculum_kwargs.get("prefetch_size", 4)
+
+        class AdaptiveTaskSampler:
+            def __init__(self, generators, eval_data):
+                import queue, threading
+                self.generators = generators
+                self.eval_data = eval_data  # list of (tname, (inputs, targets, mask), tmeta)
+                self.trainer = None         # injected after trainer is built
+                self.accs = [0.0] * len(generators)  # start: all tasks equally unknown → equal weight
+                self.step = 0
+                self._probs = [1.0 / len(generators)] * len(generators)
+                # Prefetch queue — background thread keeps GPU fed
+                self._queue = queue.Queue(maxsize=_prefetch_size)
+                self._stop = threading.Event()
+                self._thread = threading.Thread(target=self._producer, daemon=True)
+                self._thread.start()
+
+            def _sample_batch(self):
+                idx = int(np.random.choice(len(self.generators), p=self._probs))
+                length = int(np.random.randint(_mt_min, _mt_max + 1))
+                return self.generators[idx](length)
+
+            def _producer(self):
+                while not self._stop.is_set():
+                    batch = self._sample_batch()
+                    self._queue.put(batch)
+
+            def _reweight(self):
+                if self.trainer is None:
+                    return
+                import torch
+                from industrial_automaton.trainer_torch import loss_fn
+                model = self.trainer.model
+                device = self.trainer.device
+                model.eval()
+                new_accs = []
+                with torch.no_grad():
+                    for _, (ei, et, em), _ in self.eval_data:
+                        n = min(128, ei.shape[0])
+                        b_in   = torch.tensor(ei[:n], dtype=torch.long, device=device)
+                        b_tgt  = torch.tensor(et[:n], dtype=torch.long, device=device)
+                        b_mask = torch.tensor(em[:n], dtype=torch.float32, device=device)
+                        _, metrics = loss_fn(model, (b_in, b_tgt, b_mask), self.trainer.output_vocab_mask)
+                        new_accs.append(metrics["sequence_accuracy"])
+                model.train()
+                self.accs = new_accs
+                weights = [max(1.0 - a, _min_weight) for a in self.accs]
+                total = sum(weights)
+                self._probs = [w / total for w in weights]
+                names = [ed[0] for ed in self.eval_data]
+                weight_str = "  ".join(f"{n}={w:.2f}" for n, w in zip(names, self._probs))
+                print(f"[AdaptiveSampler] accs={[f'{a:.3f}' for a in self.accs]}  weights={weight_str}")
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.step += 1
+                if self.step % _reweight_interval == 0:
+                    self._reweight()
+                return self._queue.get()
+
+        combined_iter = AdaptiveTaskSampler(all_train_iters, all_eval_data)
         # Use first task's eval for Trainer's built-in early stopping
         first_eval_inputs, first_eval_targets, first_eval_mask = all_eval_data[0][1]
         first_task_meta = all_task_metadata[0]
 
         # Build model (shared across all tasks)
-        use_torch = (settings.model in ("tape_rnn", "tallerman"))
+        use_torch = (settings.model in ("tape_rnn", "tallerman", "vegstew"))
         model_kwargs = settings.model_kwargs.copy()
         if settings.embedding_type == "one_hot":
             model_kwargs["embedding_dim"] = VOCAB_SIZE
@@ -127,6 +204,7 @@ def cli():
             import torch
             from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
             from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+            from industrial_automaton.models_torch.vegstew import VegStew, VegStewConfig
             from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
             from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
@@ -136,6 +214,9 @@ def cli():
             elif settings.model == "tallerman":
                 config = TallermanConfig(**model_kwargs)
                 model_cls = Tallerman
+            elif settings.model == "vegstew":
+                config = VegStewConfig(**model_kwargs)
+                model_cls = VegStew
             else:
                 raise ValueError(f"Unknown torch model: {settings.model}")
 
@@ -178,8 +259,26 @@ def cli():
             )
 
         if settings.load_ckpt:
-            print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
-            trainer.load(settings.load_ckpt)
+            ckpt_path = settings.load_ckpt
+            if ckpt_path == "auto":
+                from pathlib import Path
+                ckpt_dir = Path(settings.save_folder) / settings.run_name / "ckpt"
+                best_link = ckpt_dir / "best"
+                if best_link.exists() or best_link.is_symlink():
+                    ckpt_path = str(best_link.resolve() / "state.pt")
+                else:
+                    step_dirs = sorted(
+                        [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("step-")],
+                        key=lambda d: int(d.name.split("-")[1]),
+                    )
+                    if not step_dirs:
+                        raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+                    ckpt_path = str(step_dirs[-1] / "state.pt")
+            print(f"{ANSI.blue('Loading checkpoint from')} {ckpt_path}...")
+            trainer.load(ckpt_path)
+
+        if isinstance(combined_iter, AdaptiveTaskSampler):
+            combined_iter.trainer = trainer
 
         print(f"\n" + "="*20 + f" {ANSI.bold('Multi-task Training')} " + "="*20)
         try:
@@ -271,7 +370,7 @@ def cli():
 
     # Initialize model based on settings
     # tape_rnn / tallerman → PyTorch + TorchTrainer (MPS); all others → JAX + Trainer
-    use_torch = (settings.model in ("tape_rnn", "tallerman"))
+    use_torch = (settings.model in ("tape_rnn", "tallerman", "vegstew"))
 
     model_kwargs = settings.model_kwargs.copy()
 
@@ -279,6 +378,7 @@ def cli():
         import torch
         from industrial_automaton.models_torch.tape import TapeRNN, TapeRNNConfig
         from industrial_automaton.models_torch.tallerman import Tallerman, TallermanConfig
+        from industrial_automaton.models_torch.vegstew import VegStew, VegStewConfig
         from industrial_automaton.models_torch.common import ModelPipeline as TorchModelPipeline
         from industrial_automaton.trainer_torch import TorchTrainer, make_generator
 
@@ -292,6 +392,9 @@ def cli():
         elif settings.model == "tallerman":
             config = TallermanConfig(**model_kwargs)
             model_cls = Tallerman
+        elif settings.model == "vegstew":
+            config = VegStewConfig(**model_kwargs)
+            model_cls = VegStew
         else:
             raise ValueError(f"Unknown torch model: {settings.model}")
 
@@ -495,8 +598,24 @@ def cli():
         )
 
     if settings.load_ckpt:
-        print(f"{ANSI.blue('Loading checkpoint from')} {settings.load_ckpt}...")
-        trainer.load(settings.load_ckpt)
+        ckpt_path = settings.load_ckpt
+        if ckpt_path == "auto":
+            from pathlib import Path
+            ckpt_dir = Path(settings.save_folder) / settings.run_name / "ckpt"
+            best_link = ckpt_dir / "best"
+            if best_link.exists() or best_link.is_symlink():
+                ckpt_path = str(best_link.resolve() / "state.pt")
+            else:
+                # Fall back to latest step dir
+                step_dirs = sorted(
+                    [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("step-")],
+                    key=lambda d: int(d.name.split("-")[1]),
+                )
+                if not step_dirs:
+                    raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+                ckpt_path = str(step_dirs[-1] / "state.pt")
+        print(f"{ANSI.blue('Loading checkpoint from')} {ckpt_path}...")
+        trainer.load(ckpt_path)
 
     # Inject pre-built curriculum state for curricula that need it (JAX only)
     if not use_torch and use_online and curriculum_state is not None:
@@ -609,11 +728,13 @@ def print_model_configs():
     
     from industrial_automaton.models_torch.tape import TapeRNNConfig as TorchTapeRNNConfig
     from industrial_automaton.models_torch.tallerman import TallermanConfig
+    from industrial_automaton.models_torch.vegstew import VegStewConfig
     configs = {
         "baby_ntm": BabyNTMModelConfig,
         "suzgun_stack_rnn": SuzgunStackRNNConfig,
         "tape_rnn [torch/mps]": TorchTapeRNNConfig,
         "tallerman [torch/mps]": TallermanConfig,
+        "vegstew [torch/mps]": VegStewConfig,
         "transformer": TransformerConfig,
         "lstm": LSTMConfig,
     }
